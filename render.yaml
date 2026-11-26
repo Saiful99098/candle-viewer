@@ -1,0 +1,15 @@
+# BLUE FISH PRIME — candle viewer (online, read-only).
+# Push this folder to GitHub, then in Render: New -> Web Service -> pick the repo.
+# Set DATABASE_URL in the Dashboard (see README_BN.md) — it is NOT in this file.
+# The viewer only reads the candles table; it never writes to the DB.
+services:
+  - type: web
+    name: blue-fish-candle-viewer
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python view_candles.py
+    envVars:
+      - key: DATABASE_URL
+        sync: false

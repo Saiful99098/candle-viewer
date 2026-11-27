@@ -24,7 +24,7 @@
 - পেজ খুলে search box-এ asset-এর নাম লিখো (যেমন EURUSD) — নিচে list আসবে, বেছে নাও; অথবা Quick chip-এ চাপ দাও। date দাও → পুরো দিনের candle টেবিল + চার্ট আসবে (ঢাকা সময়)
 - **Auto-refresh:** আজকের date হলে প্রতি ৩০ সেকেন্ডে নিজে নিজে নতুন candle আনবে — reload করতে হবে না। বন্ধ করতে চাইলে Auto-refresh টিক চিহ্ন তুলে দাও
 - **LIVE badge:** last candle ২ মিনিটের মধ্যে হলে সবুজ LIVE দেখাবে, পুরনো হলে STALE/DELAYED দেখাবে (কত মিনিট আগের সেটাও লেখা থাকবে)
-- **Gaps:** কোনো মিনিটের candle missing থাকলে stats-এ দেখাবে, যেমন "Gaps: 2 min — 02:41–02:42"
+- **CANDLE CHART:** লাইন চার্টের বদলে এখন আসল candlestick চার্ট — সবুজ/লাল candle, wick সহ। উপরে 1m / 5m / 15m / 1h বাটন আছে — পুরো দিন দেখতে 15m বা 1h ভালো, 1m-এ প্রতিটা মিনিটের candle দেখাবে (নিচের টেবিল সবসময় 1-min candle-ই দেখায়)
 - JSON হিসেবে চাইলে: `https://blue-fish-candle-viewer.onrender.com/api/candles?asset=BTCUSD_otc&date=2026-11-26`
 
 ## মনে রাখো

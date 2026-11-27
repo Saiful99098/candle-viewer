@@ -252,6 +252,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .auto-progress{width:120px;height:6px;border-radius:99px;background:#33333c;overflow:hidden;display:inline-block;vertical-align:middle}
 .auto-progress span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--violet),var(--cyan))}
 .chart-card{padding:10px 12px}
+.chart-toolbar{display:flex;gap:8px;align-items:center;margin:2px 4px 10px;flex-wrap:wrap}
+.chart-toolbar .title{font-weight:700;font-size:13px;letter-spacing:1px;color:var(--muted);margin-right:4px}
+.tf-btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:999px;
+  padding:5px 13px;font-size:13px;cursor:pointer;font-weight:700}
+.tf-btn:hover{border-color:var(--cyan)}
+.tf-btn.active{background:linear-gradient(135deg,var(--violet),var(--cyan));border-color:transparent;color:#fff}
 canvas{width:100%;height:240px;display:block}
 .table-card{padding:6px 0 10px;overflow-x:auto}
 table{border-collapse:collapse;width:100%;min-width:560px}
@@ -332,6 +338,29 @@ function statusOf(rows){
   return {cls: 'stale', label: 'STALE ' + diff + 'm'};
 }
 
+let tf = 15;  // chart timeframe in minutes (1 / 5 / 15 / 60)
+
+function aggregate(rows, tfMin){
+  // Group 1-min rows into tfMin-minute candles, aligned to the day:
+  // open = first open, high = max high, low = min low, close = last close.
+  // The last (in-progress) bucket is included — it is the live candle.
+  if (tfMin <= 1) return rows;
+  const out = [];
+  let curB = null;
+  rows.forEach(r => {
+    const b = Math.floor(toMin(r.time) / tfMin);
+    if (!curB || curB.bucket !== b){
+      curB = {bucket: b, time: r.time, open: r.open, high: r.high, low: r.low, close: r.close};
+      out.push(curB);
+    } else {
+      if (r.high > curB.high) curB.high = r.high;
+      if (r.low < curB.low) curB.low = r.low;
+      curB.close = r.close;
+    }
+  });
+  return out;
+}
+
 function drawChart(rows){
   const cv = $('ch'), ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
@@ -339,37 +368,52 @@ function drawChart(rows){
   ctx.strokeStyle = 'rgba(255,255,255,0.07)';
   ctx.lineWidth = 1;
   for (let i = 1; i < 4; i++){ const y = H * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  if (rows.length < 2){
+  const candles = aggregate(rows, tf);
+  if (candles.length < 2){
     ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
     ctx.fillText('No data to chart', 16, H / 2);
     return;
   }
-  const closes = rows.map(r => r.close);
-  const mn = Math.min.apply(null, closes), mx = Math.max.apply(null, closes);
+  let mn = Infinity, mx = -Infinity;
+  candles.forEach(c => { if (c.low < mn) mn = c.low; if (c.high > mx) mx = c.high; });
   const rg = (mx - mn) || 1;
-  const up = closes[closes.length - 1] >= closes[0];
-  const col = up ? '#22c55e' : '#f43f5e';
   const padL = 8, padR = 8, padT = 14, padB = 22;
-  const X = i => padL + i * ((W - padL - padR) / (rows.length - 1));
+  const slotW = (W - padL - padR) / candles.length;
+  const bodyW = Math.max(1, Math.floor(slotW * 0.7));
+  const X = i => padL + i * slotW + slotW / 2;
   const Y = v => padT + (1 - (v - mn) / rg) * (H - padT - padB);
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0, up ? 'rgba(34,197,94,0.30)' : 'rgba(244,63,94,0.30)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.beginPath();
-  closes.forEach((v, i) => { i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v)); });
-  ctx.lineTo(X(closes.length - 1), H - padB); ctx.lineTo(X(0), H - padB); ctx.closePath();
-  ctx.fillStyle = grad; ctx.fill();
-  ctx.beginPath();
-  closes.forEach((v, i) => { i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v)); });
-  ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
-  const lx = X(closes.length - 1), ly = Y(closes[closes.length - 1]);
-  ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
+  candles.forEach((c, i) => {
+    const col = c.close > c.open ? '#22c55e' : (c.close < c.open ? '#f43f5e' : '#f59e0b');
+    const x = X(i);
+    // wick: high to low
+    ctx.strokeStyle = col; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, Y(c.high)); ctx.lineTo(x, Y(c.low)); ctx.stroke();
+    // body: open to close (doji = a flat line)
+    const yO = Y(c.open), yC = Y(c.close);
+    ctx.fillStyle = col;
+    if (Math.abs(yO - yC) < 1){
+      ctx.fillRect(x - bodyW / 2, yO - 0.5, bodyW, 1);
+    } else {
+      ctx.fillRect(x - bodyW / 2, Math.min(yO, yC), bodyW, Math.abs(yO - yC));
+    }
+  });
+  const last = candles[candles.length - 1];
+  const lastCol = last.close > last.open ? '#22c55e' : (last.close < last.open ? '#f43f5e' : '#f59e0b');
   ctx.fillStyle = '#9a9ca8'; ctx.font = '12px system-ui';
-  ctx.fillText(rows[0].time, 10, H - 6);
-  ctx.fillText(rows[rows.length - 1].time, W - 46, H - 6);
-  ctx.fillStyle = col; ctx.font = 'bold 13px system-ui';
-  ctx.fillText(fmtPrice(closes[closes.length - 1]), Math.max(10, lx - 70), Math.max(16, ly - 10));
+  ctx.fillText(candles[0].time, 10, H - 6);
+  ctx.fillText(last.time, W - 46, H - 6);
+  ctx.fillStyle = lastCol; ctx.font = 'bold 13px system-ui';
+  ctx.fillText(fmtPrice(last.close), Math.max(10, X(candles.length - 1) - 70), Math.max(16, Y(last.close) - 10));
 }
+
+document.querySelectorAll('.tf-btn').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    tf = parseInt(b.dataset.tf, 10) || 15;
+    drawChart(cur.rows);
+  });
+});
 
 function renderAll(){
   const rows = cur.rows;
@@ -547,7 +591,15 @@ def page_html(asset, date_str, assets, rows, error=""):
   <span class="auto-progress"><span id="autoBar"></span></span>
   <span id="autoText">Next refresh in 30s</span>
 </div>
-<div class="card chart-card"><canvas id="ch" width="940" height="240"></canvas></div>
+<div class="card chart-card">
+  <div class="chart-toolbar"><span class="title">CANDLE CHART</span>
+    <button type="button" class="tf-btn" data-tf="1">1m</button>
+    <button type="button" class="tf-btn" data-tf="5">5m</button>
+    <button type="button" class="tf-btn active" data-tf="15">15m</button>
+    <button type="button" class="tf-btn" data-tf="60">1h</button>
+  </div>
+  <canvas id="ch" width="940" height="240"></canvas>
+</div>
 <div class="card table-card">
   <table><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Dir</th></tr></thead>
   <tbody id="tbody">{trs}</tbody></table>

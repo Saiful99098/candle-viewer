@@ -212,10 +212,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .search input:focus,.controls input[type=date]:focus{border-color:var(--cyan)}
 .asset-list{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;display:none;
   background:var(--panel2);border:1px solid var(--border);border-radius:10px;overflow:hidden;
-  max-height:260px;overflow-y:auto;box-shadow:0 12px 30px rgba(0,0,0,.5)}
+  max-height:320px;overflow-y:auto;box-shadow:0 12px 30px rgba(0,0,0,.5)}
 .match{padding:10px 12px;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:14px}
 .match:hover{background:rgba(139,92,246,.18)}
 .match.empty{color:var(--muted);cursor:default}
+.match-count{padding:8px 12px;color:var(--muted);font-size:12px;border-top:1px solid var(--border);
+  position:sticky;bottom:0;background:var(--panel2)}
 .controls button{background:linear-gradient(135deg,var(--violet),var(--cyan));color:#fff;border:0;
   border-radius:10px;padding:11px 22px;font-size:15px;font-weight:700;cursor:pointer}
 .controls button:hover{filter:brightness(1.12)}
@@ -432,9 +434,10 @@ function refreshIfToday(){
 const search = $('assetSearch'), list = $('assetList');
 function showMatches(q){
   q = (q || '').trim().toUpperCase();
-  const m = ASSETS.filter(a => !q || a.toUpperCase().includes(q)).slice(0, 8);
+  const m = ASSETS.filter(a => !q || a.toUpperCase().includes(q));
   if (!m.length){ list.innerHTML = '<div class="match empty">No asset matches.</div>'; list.style.display = 'block'; return; }
-  list.innerHTML = m.map(a => '<div class="match" data-a="' + a + '">' + a + '</div>').join('');
+  list.innerHTML = m.map(a => '<div class="match" data-a="' + a + '">' + a + '</div>').join('') +
+    '<div class="match-count">' + m.length + ' assets — scroll or type to filter</div>';
   list.style.display = 'block';
 }
 search.addEventListener('input', () => showMatches(search.value));

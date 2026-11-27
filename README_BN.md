@@ -25,6 +25,7 @@
 - **Auto-refresh:** আজকের date হলে প্রতি ৩০ সেকেন্ডে নিজে নিজে নতুন candle আনবে — reload করতে হবে না। বন্ধ করতে চাইলে Auto-refresh টিক চিহ্ন তুলে দাও
 - **LIVE badge:** last candle ২ মিনিটের মধ্যে হলে সবুজ LIVE দেখাবে, পুরনো হলে STALE/DELAYED দেখাবে (কত মিনিট আগের সেটাও লেখা থাকবে)
 - **CANDLE CHART:** লাইন চার্টের বদলে এখন আসল candlestick চার্ট — সবুজ/লাল candle, wick সহ। উপরে 1m / 5m / 15m / 1h বাটন আছে — পুরো দিন দেখতে 15m বা 1h ভালো, 1m-এ প্রতিটা মিনিটের candle দেখাবে (নিচের টেবিল সবসময় 1-min candle-ই দেখায়)
+- **ZOOM:** চার্টের উপরে mouse wheel ঘোরালে zoom in/out হবে (cursor যেখানে সেখানেই zoom হবে), চার্ট ধরে টানলে (drag) ডানে-বামে সরানো যাবে। ফোনে **+ / −** বাটন চাপলে zoom হবে, **Full day** চাপলে আবার পুরো দিন দেখাবে
 - JSON হিসেবে চাইলে: `https://blue-fish-candle-viewer.onrender.com/api/candles?asset=BTCUSD_otc&date=2026-11-26`
 
 ## মনে রাখো

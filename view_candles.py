@@ -258,6 +258,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   padding:5px 13px;font-size:13px;cursor:pointer;font-weight:700}
 .tf-btn:hover{border-color:var(--cyan)}
 .tf-btn.active{background:linear-gradient(135deg,var(--violet),var(--cyan));border-color:transparent;color:#fff}
+.zoom-btn{font-size:15px;padding:5px 12px}
+canvas{width:100%;height:240px;display:block;cursor:grab;touch-action:none}
 canvas{width:100%;height:240px;display:block}
 .table-card{padding:6px 0 10px;overflow-x:auto}
 table{border-collapse:collapse;width:100%;min-width:560px}
@@ -368,7 +370,8 @@ function drawChart(rows){
   ctx.strokeStyle = 'rgba(255,255,255,0.07)';
   ctx.lineWidth = 1;
   for (let i = 1; i < 4; i++){ const y = H * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  const candles = aggregate(rows, tf);
+  const all = aggregate(rows, tf);
+  const candles = view ? all.slice(Math.max(0, Math.floor(view[0])), Math.min(all.length, Math.ceil(view[1]))) : all;
   if (candles.length < 2){
     ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
     ctx.fillText('No data to chart', 16, H / 2);
@@ -406,14 +409,94 @@ function drawChart(rows){
   ctx.fillText(fmtPrice(last.close), Math.max(10, X(candles.length - 1) - 70), Math.max(16, Y(last.close) - 10));
 }
 
-document.querySelectorAll('.tf-btn').forEach(b => {
+document.querySelectorAll('.tf-btn[data-tf]').forEach(b => {
   b.addEventListener('click', () => {
-    document.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tf-btn[data-tf]').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
     tf = parseInt(b.dataset.tf, 10) || 15;
+    view = null;  // new timeframe = full day again
     drawChart(cur.rows);
   });
 });
+
+// Zoom + pan (the owner, 2026-11-27): wheel zooms around the cursor,
+// drag pans, + / − buttons zoom for touch screens, Full day resets.
+// view = [a, b] float indices into the aggregated candles, null = full day.
+let view = null;
+const MIN_WIN = 10;
+
+function clampView(a, b, total){
+  const minLen = Math.min(MIN_WIN, total);
+  let len = b - a;
+  if (len < minLen){ const c = (a + b) / 2; a = c - minLen / 2; b = c + minLen / 2; len = minLen; }
+  if (len > total){ a = 0; b = total; }
+  if (a < 0){ b -= a; a = 0; }
+  if (b > total){ a -= (b - total); b = total; }
+  if (a < 0) a = 0;
+  return [a, b];
+}
+function zoomView(a, b, total, center, factor){
+  const len = (b - a) * factor;
+  const na = center - (center - a) * factor;
+  return clampView(na, na + len, total);
+}
+function panView(a, b, total, delta){
+  return clampView(a + delta, b + delta, total);
+}
+function setView(nv, total){
+  view = (nv[1] - nv[0] >= total - 0.5) ? null : nv;
+  drawChart(cur.rows);
+}
+function zoomCenter(factor){
+  const total = aggregate(cur.rows, tf).length;
+  if (total < 2) return;
+  let a = 0, b = total;
+  if (view){ a = view[0]; b = view[1]; }
+  setView(zoomView(a, b, total, (a + b) / 2, factor), total);
+}
+$('zoomIn').addEventListener('click', () => zoomCenter(0.7));
+$('zoomOut').addEventListener('click', () => zoomCenter(1.4));
+$('zoomReset').addEventListener('click', () => { view = null; drawChart(cur.rows); });
+
+const cvEl = $('ch');
+function canvasX(clientX){
+  const rect = cvEl.getBoundingClientRect();
+  return (clientX - rect.left) * (cvEl.width / rect.width);
+}
+cvEl.addEventListener('wheel', e => {
+  e.preventDefault();
+  const total = aggregate(cur.rows, tf).length;
+  if (total < 2) return;
+  let a = 0, b = total;
+  if (view){ a = view[0]; b = view[1]; }
+  const slotW = (cvEl.width - 16) / (b - a);
+  let idx = a + Math.floor((canvasX(e.clientX) - 8) / slotW);
+  idx = Math.max(a, Math.min(b - 1, idx));
+  setView(zoomView(a, b, total, idx, e.deltaY < 0 ? 0.8 : 1.25), total);
+}, {passive: false});
+
+let drag = null;
+function dragStart(clientX){
+  drag = {x: clientX, view: view ? view.slice() : null};
+  cvEl.style.cursor = 'grabbing';
+}
+function dragMove(clientX){
+  if (!drag) return;
+  const total = aggregate(cur.rows, tf).length;
+  if (total < 2) return;
+  let a = 0, b = total;
+  if (drag.view){ a = drag.view[0]; b = drag.view[1]; }
+  const slotW = (cvEl.width - 16) / (b - a);
+  const delta = -(canvasX(clientX) - canvasX(drag.x)) / slotW;
+  setView(panView(a, b, total, delta), total);
+}
+function dragEnd(){ drag = null; cvEl.style.cursor = 'grab'; }
+cvEl.addEventListener('mousedown', e => dragStart(e.clientX));
+window.addEventListener('mousemove', e => dragMove(e.clientX));
+window.addEventListener('mouseup', dragEnd);
+cvEl.addEventListener('touchstart', e => { if (e.touches.length === 1) dragStart(e.touches[0].clientX); }, {passive: true});
+cvEl.addEventListener('touchmove', e => { if (e.touches.length === 1){ e.preventDefault(); dragMove(e.touches[0].clientX); } }, {passive: false});
+cvEl.addEventListener('touchend', dragEnd);
 
 function renderAll(){
   const rows = cur.rows;
@@ -456,6 +539,7 @@ async function loadAsset(asset, date){
     const r = await fetch(url);
     const j = await r.json();
     cur.asset = j.asset; cur.date = j.date; cur.rows = j.candles || [];
+    view = null;  // new asset/date = full day again
     document.title = 'Candles — ' + cur.asset + ' ' + cur.date;
     history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date));
     $('dateInput').value = cur.date;
@@ -597,6 +681,10 @@ def page_html(asset, date_str, assets, rows, error=""):
     <button type="button" class="tf-btn" data-tf="5">5m</button>
     <button type="button" class="tf-btn active" data-tf="15">15m</button>
     <button type="button" class="tf-btn" data-tf="60">1h</button>
+    <span class="title" style="margin-left:8px">ZOOM</span>
+    <button type="button" id="zoomOut" class="tf-btn zoom-btn">−</button>
+    <button type="button" id="zoomIn" class="tf-btn zoom-btn">+</button>
+    <button type="button" id="zoomReset" class="tf-btn">Full day</button>
   </div>
   <canvas id="ch" width="940" height="240"></canvas>
 </div>

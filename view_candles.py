@@ -24,6 +24,9 @@ The viewer shows only candles (market data) — no password is ever shown.
 
 Demo (no DB needed, fake sample candles, just to see the page):
     python view_candles.py --demo
+
+UI: dark-ash premium theme, asset search, auto-refresh every 30s
+for today, live/stale badge, and a gap detector in the stats.
 """
 from __future__ import annotations
 
@@ -158,42 +161,400 @@ STORE = None  # set in main()
 
 
 # -------------------------------------------------------------- HTML ----
+def fmt_price(v):
+    """Short readable price: big prices get 2 decimals, small ones 5."""
+    v = float(v)
+    if v >= 1000:
+        return f"{v:,.2f}"
+    if v >= 100:
+        return f"{v:.3f}"
+    return f"{v:.5f}"
+
+
+def dir_pill(r):
+    if r["close"] > r["open"]:
+        return '<span class="pill call">CALL</span>'
+    if r["close"] < r["open"]:
+        return '<span class="pill put">PUT</span>'
+    return '<span class="pill doji">DOJI</span>'
+
+
+CSS = """
+:root{
+  --bg:#16161a; --panel:#222228; --panel2:#2b2b33; --border:#3a3a44;
+  --text:#edeef2; --muted:#9a9ca8;
+  --violet:#8b5cf6; --cyan:#06b6d4; --green:#22c55e; --red:#f43f5e; --amber:#f59e0b;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',sans-serif}
+.topbar{height:4px;background:linear-gradient(90deg,var(--violet),var(--cyan),var(--green))}
+.wrap{max-width:1000px;margin:0 auto;padding:16px 14px 40px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 16px;margin-bottom:12px}
+.hero{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
+  border:1px solid transparent;
+  background:linear-gradient(var(--panel),var(--panel)) padding-box,
+    linear-gradient(135deg,var(--violet),var(--cyan),var(--green)) border-box}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:17px;color:#fff;background:linear-gradient(135deg,var(--violet),var(--cyan))}
+.brand h1{margin:0;font-size:20px;letter-spacing:1px}
+.brand h1 span{background:linear-gradient(90deg,var(--violet),var(--cyan));-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand p{margin:2px 0 0;color:var(--muted);font-size:12px;letter-spacing:2px}
+.hero-right{display:flex;align-items:center;gap:10px}
+.clock{font-family:ui-monospace,Menlo,monospace;font-size:15px;color:var(--text)}
+.auto-pill{padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:1px}
+.auto-pill.on{background:rgba(34,197,94,.18);color:#4ade80}
+.auto-pill.off{background:rgba(255,255,255,.08);color:var(--muted)}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.search{position:relative;flex:1;min-width:220px}
+.search input,.controls input[type=date]{width:100%;background:#17171b;border:1px solid var(--border);
+  color:var(--text);border-radius:10px;padding:11px 12px;font-size:15px;outline:none}
+.search input:focus,.controls input[type=date]:focus{border-color:var(--cyan)}
+.asset-list{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;display:none;
+  background:var(--panel2);border:1px solid var(--border);border-radius:10px;overflow:hidden;
+  max-height:260px;overflow-y:auto;box-shadow:0 12px 30px rgba(0,0,0,.5)}
+.match{padding:10px 12px;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:14px}
+.match:hover{background:rgba(139,92,246,.18)}
+.match.empty{color:var(--muted);cursor:default}
+.controls button{background:linear-gradient(135deg,var(--violet),var(--cyan));color:#fff;border:0;
+  border-radius:10px;padding:11px 22px;font-size:15px;font-weight:700;cursor:pointer}
+.controls button:hover{filter:brightness(1.12)}
+.auto-toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer;white-space:nowrap}
+.auto-toggle input{accent-color:var(--violet);width:16px;height:16px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 2px 12px;align-items:center;color:var(--muted);font-size:13px}
+.chip{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;
+  padding:6px 12px;font-size:13px;cursor:pointer;font-family:ui-monospace,Menlo,monospace}
+.chip:hover{border-color:var(--cyan);color:#67e8f9}
+.err{color:#fb7185;margin:0 2px 12px;font-size:14px}
+.err:empty{display:none}
+.asset-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.asset-name{font-size:22px;font-weight:800;font-family:ui-monospace,Menlo,monospace}
+.asset-date{color:var(--muted);font-size:13px;margin-top:2px}
+.asset-head-right{display:flex;align-items:center;gap:12px}
+.badge{padding:5px 12px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.5px}
+.badge.live{background:rgba(34,197,94,.18);color:#4ade80;animation:pulse 1.6s infinite}
+.badge.delayed{background:rgba(245,158,11,.18);color:#fbbf24}
+.badge.stale{background:rgba(244,63,94,.18);color:#fb7185}
+.badge.hist{background:rgba(255,255,255,.08);color:var(--muted)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.last-price{font-family:ui-monospace,Menlo,monospace;font-size:19px;font-weight:700}
+.last-price.up{color:#4ade80}
+.last-price.down{color:#fb7185}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.stat .label{color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase}
+.stat .value{font-size:20px;font-weight:700;margin-top:4px;font-family:ui-monospace,Menlo,monospace}
+.status-line{display:flex;gap:16px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:13px}
+.status-line .ok{color:#4ade80}
+.status-line .warn{color:#fbbf24}
+.auto-progress{width:120px;height:6px;border-radius:99px;background:#33333c;overflow:hidden;display:inline-block;vertical-align:middle}
+.auto-progress span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--violet),var(--cyan))}
+.chart-card{padding:10px 12px}
+canvas{width:100%;height:240px;display:block}
+.table-card{padding:6px 0 10px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:560px}
+td,th{padding:7px 12px;text-align:right;font-family:ui-monospace,Menlo,monospace;font-size:13px;border-bottom:1px solid #2e2e36}
+td:first-child,th:first-child{text-align:left}
+thead th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase}
+tbody tr:nth-child(even){background:rgba(255,255,255,.02)}
+tbody tr:hover{background:rgba(139,92,246,.08)}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
+.pill.call{background:rgba(34,197,94,.15);color:#4ade80}
+.pill.put{background:rgba(244,63,94,.15);color:#fb7185}
+.pill.doji{background:rgba(245,158,11,.15);color:#fbbf24}
+.empty{color:var(--muted);text-align:center !important;padding:18px !important}
+.row-count{color:var(--muted);font-size:12px;margin:10px 14px 0}
+footer{color:var(--muted);font-size:12px;text-align:center;margin-top:18px;line-height:1.7}
+@media (max-width:640px){
+  .brand h1{font-size:17px}
+  .asset-name{font-size:18px}
+  .controls button{width:100%}
+}
+"""
+
+JS = """
+const init = JSON.parse(document.getElementById('init').textContent);
+const ASSETS = init.assets || [];
+let cur = {asset: init.asset, date: init.date, rows: init.rows || []};
+let autoOn = true;
+let countdown = 30;
+const $ = id => document.getElementById(id);
+
+function fmtPrice(v){
+  v = Number(v);
+  if (v >= 1000) return v.toLocaleString('en-US',{minimumFractionDigits:2, maximumFractionDigits:2});
+  if (v >= 100) return v.toFixed(3);
+  return v.toFixed(5);
+}
+function toMin(t){ const p = t.split(':'); return (+p[0]) * 60 + (+p[1]); }
+function toHHMM(m){ return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }
+function dirOf(r){ return r.close > r.open ? 'CALL' : (r.close < r.open ? 'PUT' : 'DOJI'); }
+function pillOf(r){ const d = dirOf(r); return '<span class="pill ' + d.toLowerCase() + '">' + d + '</span>'; }
+
+function computeGaps(rows){
+  if (rows.length < 2) return {count: 0, ranges: []};
+  const mins = rows.map(r => toMin(r.time));
+  const have = new Set(mins);
+  const missing = [];
+  for (let m = mins[0]; m <= mins[mins.length - 1]; m++){ if (!have.has(m)) missing.push(m); }
+  const ranges = [];
+  for (let i = 0; i < missing.length;){
+    let j = i;
+    while (j + 1 < missing.length && missing[j + 1] === missing[j] + 1) j++;
+    ranges.push([missing[i], missing[j]]);
+    i = j + 1;
+  }
+  return {count: missing.length, ranges: ranges};
+}
+function gapsText(g){
+  if (!g.count) return '<span class="ok">None</span>';
+  const parts = g.ranges.slice(0, 4).map(r => r[0] === r[1] ? toHHMM(r[0]) : toHHMM(r[0]) + '–' + toHHMM(r[1]));
+  let s = g.count + ' min — ' + parts.join(', ');
+  if (g.ranges.length > 4) s += ' (+' + (g.ranges.length - 4) + ' more)';
+  return '<span class="warn">' + s + '</span>';
+}
+function dhakaNow(){
+  const d = new Date();
+  const time = d.toLocaleTimeString('en-GB', {timeZone: 'Asia/Dhaka', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false});
+  const date = d.toLocaleDateString('en-CA', {timeZone: 'Asia/Dhaka'});
+  return {time: time, date: date, min: (+time.slice(0, 2)) * 60 + (+time.slice(3, 5))};
+}
+function statusOf(rows){
+  const now = dhakaNow();
+  if (!rows.length) return {cls: 'stale', label: 'NO DATA'};
+  if (cur.date !== now.date) return {cls: 'hist', label: 'HISTORY'};
+  const last = toMin(rows[rows.length - 1].time);
+  const diff = now.min - last;
+  if (diff <= 2) return {cls: 'live', label: '● LIVE'};
+  if (diff <= 10) return {cls: 'delayed', label: 'DELAYED ' + diff + 'm'};
+  return {cls: 'stale', label: 'STALE ' + diff + 'm'};
+}
+
+function drawChart(rows){
+  const cv = $('ch'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++){ const y = H * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  if (rows.length < 2){
+    ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
+    ctx.fillText('No data to chart', 16, H / 2);
+    return;
+  }
+  const closes = rows.map(r => r.close);
+  const mn = Math.min.apply(null, closes), mx = Math.max.apply(null, closes);
+  const rg = (mx - mn) || 1;
+  const up = closes[closes.length - 1] >= closes[0];
+  const col = up ? '#22c55e' : '#f43f5e';
+  const padL = 8, padR = 8, padT = 14, padB = 22;
+  const X = i => padL + i * ((W - padL - padR) / (rows.length - 1));
+  const Y = v => padT + (1 - (v - mn) / rg) * (H - padT - padB);
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, up ? 'rgba(34,197,94,0.30)' : 'rgba(244,63,94,0.30)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.beginPath();
+  closes.forEach((v, i) => { i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v)); });
+  ctx.lineTo(X(closes.length - 1), H - padB); ctx.lineTo(X(0), H - padB); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath();
+  closes.forEach((v, i) => { i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v)); });
+  ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+  const lx = X(closes.length - 1), ly = Y(closes[closes.length - 1]);
+  ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
+  ctx.fillStyle = '#9a9ca8'; ctx.font = '12px system-ui';
+  ctx.fillText(rows[0].time, 10, H - 6);
+  ctx.fillText(rows[rows.length - 1].time, W - 46, H - 6);
+  ctx.fillStyle = col; ctx.font = 'bold 13px system-ui';
+  ctx.fillText(fmtPrice(closes[closes.length - 1]), Math.max(10, lx - 70), Math.max(16, ly - 10));
+}
+
+function renderAll(){
+  const rows = cur.rows;
+  $('statCount').textContent = rows.length;
+  $('statFirst').textContent = rows.length ? rows[0].time : '—';
+  $('statLast').textContent = rows.length ? rows[rows.length - 1].time : '—';
+  if (rows.length){
+    let hi = -Infinity, lo = Infinity;
+    rows.forEach(r => { if (r.high > hi) hi = r.high; if (r.low < lo) lo = r.low; });
+    $('statHigh').textContent = fmtPrice(hi);
+    $('statLow').textContent = fmtPrice(lo);
+  } else { $('statHigh').textContent = '—'; $('statLow').textContent = '—'; }
+  const st = statusOf(rows);
+  const b = $('liveBadge'); b.className = 'badge ' + st.cls; b.textContent = st.label;
+  $('gapsLine').innerHTML = 'Gaps: ' + gapsText(computeGaps(rows));
+  $('assetTitle').textContent = cur.asset;
+  $('dateTitle').textContent = cur.date + ' (Dhaka time)';
+  const lastP = rows.length ? rows[rows.length - 1].close : null;
+  const firstO = rows.length ? rows[0].open : null;
+  const lp = $('lastPrice');
+  if (lastP !== null){
+    lp.textContent = (lastP >= firstO ? '▲ ' : '▼ ') + fmtPrice(lastP);
+    lp.className = 'last-price ' + (lastP >= firstO ? 'up' : 'down');
+  } else { lp.textContent = '—'; lp.className = 'last-price'; }
+  let h = '';
+  rows.forEach(r => {
+    h += '<tr><td>' + r.time + '</td><td>' + fmtPrice(r.open) + '</td><td>' + fmtPrice(r.high) +
+      '</td><td>' + fmtPrice(r.low) + '</td><td>' + fmtPrice(r.close) + '</td><td>' + pillOf(r) + '</td></tr>';
+  });
+  $('tbody').innerHTML = h || '<tr><td colspan="6" class="empty">No candles for this asset on this date.</td></tr>';
+  $('rowCount').textContent = rows.length + ' candles';
+  drawChart(rows);
+}
+
+async function loadAsset(asset, date){
+  asset = (asset || '').trim();
+  if (!asset) return;
+  const url = '/api/candles?asset=' + encodeURIComponent(asset) + '&date=' + encodeURIComponent(date || cur.date);
+  try {
+    const r = await fetch(url);
+    const j = await r.json();
+    cur.asset = j.asset; cur.date = j.date; cur.rows = j.candles || [];
+    document.title = 'Candles — ' + cur.asset + ' ' + cur.date;
+    history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date));
+    $('dateInput').value = cur.date;
+    $('errLine').textContent = cur.rows.length ? '' : 'No candles for this asset on this date — try another date.';
+    renderAll();
+    setUpdated();
+    countdown = 30;
+  } catch (e){
+    $('errLine').textContent = 'Could not load candles — check connection and retry.';
+  }
+}
+
+function setUpdated(){ $('updatedAt').textContent = 'Updated ' + dhakaNow().time + ' (Dhaka)'; }
+function refreshIfToday(){
+  if (!autoOn) return;
+  if (cur.date !== dhakaNow().date) return;
+  loadAsset(cur.asset, cur.date);
+}
+
+const search = $('assetSearch'), list = $('assetList');
+function showMatches(q){
+  q = (q || '').trim().toUpperCase();
+  const m = ASSETS.filter(a => !q || a.toUpperCase().includes(q)).slice(0, 8);
+  if (!m.length){ list.innerHTML = '<div class="match empty">No asset matches.</div>'; list.style.display = 'block'; return; }
+  list.innerHTML = m.map(a => '<div class="match" data-a="' + a + '">' + a + '</div>').join('');
+  list.style.display = 'block';
+}
+search.addEventListener('input', () => showMatches(search.value));
+search.addEventListener('focus', () => showMatches(search.value));
+document.addEventListener('click', e => { if (!e.target.closest('.search')) list.style.display = 'none'; });
+list.addEventListener('click', e => {
+  const t = e.target.closest('.match');
+  if (!t || !t.dataset.a) return;
+  search.value = t.dataset.a; list.style.display = 'none';
+  loadAsset(t.dataset.a, $('dateInput').value);
+});
+search.addEventListener('keydown', e => {
+  if (e.key === 'Enter'){
+    e.preventDefault();
+    const first = list.querySelector('.match[data-a]');
+    if (first){ search.value = first.dataset.a; list.style.display = 'none'; loadAsset(first.dataset.a, $('dateInput').value); }
+  }
+});
+document.querySelectorAll('.chip').forEach(c => {
+  c.addEventListener('click', () => { search.value = c.dataset.a; loadAsset(c.dataset.a, $('dateInput').value); });
+});
+$('showForm').addEventListener('submit', e => { e.preventDefault(); loadAsset(search.value, $('dateInput').value); });
+$('autoToggle').addEventListener('change', e => {
+  autoOn = e.target.checked;
+  $('autoPill').textContent = autoOn ? 'AUTO ON' : 'AUTO OFF';
+  $('autoPill').className = 'auto-pill ' + (autoOn ? 'on' : 'off');
+  countdown = 30;
+});
+setInterval(() => { $('clock').textContent = dhakaNow().time + ' Dhaka'; }, 1000);
+setInterval(() => {
+  if (!autoOn) return;
+  countdown--;
+  $('autoBar').style.width = ((30 - countdown) / 30 * 100) + '%';
+  $('autoText').textContent = 'Next refresh in ' + countdown + 's';
+  if (countdown <= 0){ countdown = 30; refreshIfToday(); }
+}, 1000);
+renderAll();
+setUpdated();
+$('clock').textContent = dhakaNow().time + ' Dhaka';
+"""
+
+
 def page_html(asset, date_str, assets, rows, error=""):
-    opts = "".join(
-        f'<option value="{html.escape(a)}"'
-        f'{" selected" if a == asset else ""}>{html.escape(a)}</option>'
-        for a in assets
-    )
     trs = "".join(
-        f"<tr><td>{r['time']}</td><td>{r['open']:.5f}</td>"
-        f"<td>{r['high']:.5f}</td><td>{r['low']:.5f}</td>"
-        f"<td>{r['close']:.5f}</td>"
-        f"<td>{'CALL' if r['close'] > r['open'] else 'PUT' if r['close'] < r['open'] else 'DOJI'}</td></tr>"
+        f"<tr><td>{r['time']}</td><td>{fmt_price(r['open'])}</td>"
+        f"<td>{fmt_price(r['high'])}</td><td>{fmt_price(r['low'])}</td>"
+        f"<td>{fmt_price(r['close'])}</td><td>{dir_pill(r)}</td></tr>"
         for r in rows
     )
-    data = json.dumps([r["close"] for r in rows])
-    labels = json.dumps([r["time"] for r in rows])
-    err = f'<p style="color:#b00">{html.escape(error)}</p>' if error else ""
+    popular = [a for a in ("BTCUSD_otc", "EURUSD_otc", "USDPKR_otc", "USDMXN_otc")
+               if a in assets]
+    chips = "".join(
+        f'<button type="button" class="chip" data-a="{html.escape(a)}">'
+        f"{html.escape(a)}</button>" for a in popular
+    )
+    hi = fmt_price(max((r["high"] for r in rows), default=0)) if rows else "—"
+    lo = fmt_price(min((r["low"] for r in rows), default=0)) if rows else "—"
+    init = json.dumps({"asset": asset, "date": date_str, "assets": assets, "rows": rows})
+    err = html.escape(error) if error else ""
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Candles — {html.escape(asset or '')} {html.escape(date_str)}</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:900px;margin:20px auto;padding:0 12px}}
-table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;text-align:right;font-family:monospace}}td:first-child,th:first-child{{text-align:left}}select,input,button{{padding:6px;font-size:15px}}canvas{{width:100%;height:220px;border:1px solid #ddd}}</style>
-</head><body>
-<h2>BLUE FISH PRIME — Candle viewer</h2>
-<form method="get"><select name="asset">{opts}</select>
-<input type="date" name="date" value="{html.escape(date_str)}">
-<button type="submit">Show</button></form>
-{err}
-<p><b>{html.escape(asset or '')}</b> — {html.escape(date_str)} (Dhaka time) — <b>{len(rows)}</b> candles</p>
-<canvas id="ch" width="880" height="220"></canvas>
-<table><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Dir</th></tr>{trs}</table>
-<script>
-const data={data}, labels={labels};
-const cv=document.getElementById('ch'), ctx=cv.getContext('2d');
-if(data.length>1){{const mn=Math.min(...data), mx=Math.max(...data), rg=(mx-mn)||1;
-ctx.beginPath(); data.forEach((v,i)=>{{const x=10+i*(860/(data.length-1)), y=200-((v-mn)/rg)*180; i?ctx.lineTo(x,y):ctx.moveTo(x,y);}}); ctx.strokeStyle='#2563eb'; ctx.lineWidth=2; ctx.stroke();
-ctx.fillStyle='#555'; ctx.fillText(labels[0]||'',10,215); ctx.fillText(labels[labels.length-1]||'',800,215);}}
-</script></body></html>"""
+<style>{CSS}</style>
+</head><body><div class="topbar"></div><div class="wrap">
+<header class="hero card">
+  <div class="brand"><div class="logo">BF</div><div>
+    <h1>BLUE FISH <span>PRIME</span></h1>
+    <p>LITTLE MATRIX &bull; CANDLE VIEWER</p>
+  </div></div>
+  <div class="hero-right">
+    <div id="clock" class="clock">--:--:-- Dhaka</div>
+    <span id="autoPill" class="auto-pill on">AUTO ON</span>
+  </div>
+</header>
+<form id="showForm" class="card controls" method="get" action="/">
+  <div class="search">
+    <input id="assetSearch" name="asset" type="text" value="{html.escape(asset or '')}"
+      placeholder="Search asset... e.g. EURUSD" autocomplete="off" spellcheck="false">
+    <div id="assetList" class="asset-list"></div>
+  </div>
+  <input id="dateInput" name="date" type="date" value="{html.escape(date_str)}">
+  <button type="submit">Show</button>
+  <label class="auto-toggle"><input id="autoToggle" type="checkbox" checked> Auto-refresh</label>
+</form>
+<div class="chips">Quick: {chips}</div>
+<p id="errLine" class="err">{err}</p>
+<div class="asset-head card">
+  <div>
+    <div id="assetTitle" class="asset-name">{html.escape(asset or '')}</div>
+    <div id="dateTitle" class="asset-date">{html.escape(date_str)} (Dhaka time)</div>
+  </div>
+  <div class="asset-head-right">
+    <span id="liveBadge" class="badge hist">—</span>
+    <span id="lastPrice" class="last-price">—</span>
+  </div>
+</div>
+<div class="stats">
+  <div class="stat"><div class="label">Candles</div><div class="value" id="statCount">{len(rows)}</div></div>
+  <div class="stat"><div class="label">First</div><div class="value" id="statFirst">{rows[0]['time'] if rows else '—'}</div></div>
+  <div class="stat"><div class="label">Last</div><div class="value" id="statLast">{rows[-1]['time'] if rows else '—'}</div></div>
+  <div class="stat"><div class="label">Day High</div><div class="value" id="statHigh">{hi}</div></div>
+  <div class="stat"><div class="label">Day Low</div><div class="value" id="statLow">{lo}</div></div>
+</div>
+<div class="status-line card">
+  <span id="gapsLine">Gaps: —</span>
+  <span id="updatedAt">Updated —</span>
+  <span class="auto-progress"><span id="autoBar"></span></span>
+  <span id="autoText">Next refresh in 30s</span>
+</div>
+<div class="card chart-card"><canvas id="ch" width="940" height="240"></canvas></div>
+<div class="card table-card">
+  <table><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Dir</th></tr></thead>
+  <tbody id="tbody">{trs}</tbody></table>
+  <p id="rowCount" class="row-count">{len(rows)} candles</p>
+</div>
+<footer>Data: littlematrix-db (read-only) &bull; Auto-refresh every 30s for today &bull; All times Dhaka</footer>
+</div>
+<script id="init" type="application/json">{init}</script>
+<script>{JS}</script>
+</body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):

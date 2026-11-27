@@ -447,6 +447,17 @@ function setView(nv, total){
   view = (nv[1] - nv[0] >= total - 0.5) ? null : nv;
   drawChart(cur.rows);
 }
+// After new candles arrive, where should the zoomed view go? If it
+// was pinned to the live (right) edge, slide it right by the new
+// candles so the latest stays visible; if it was looking at older
+// candles, leave it exactly where it was; a full view stays full.
+function followView(view, oldTotal, newTotal){
+  if (!view) return null;
+  if (view[1] - view[0] >= oldTotal - 0.5) return null;
+  if (view[1] < oldTotal - 0.5) return view;
+  const len = view[1] - view[0];
+  return [newTotal - len, newTotal];
+}
 function zoomCenter(factor){
   const total = aggregate(cur.rows, tf).length;
   if (total < 2) return;
@@ -531,15 +542,26 @@ function renderAll(){
   drawChart(rows);
 }
 
-async function loadAsset(asset, date){
+async function loadAsset(asset, date, keepView){
   asset = (asset || '').trim();
   if (!asset) return;
   const url = '/api/candles?asset=' + encodeURIComponent(asset) + '&date=' + encodeURIComponent(date || cur.date);
   try {
     const r = await fetch(url);
     const j = await r.json();
+    // Bug fix (the owner, 2026-11-27): the 30s auto-refresh calls
+    // loadAsset for the SAME asset/date — it used to reset view to
+    // null every time, so the chart zoomed out whenever a new candle
+    // arrived. Now a refresh (keepView) keeps the zoom; only a real
+    // asset/date change resets to the full day.
+    const oldTotal = aggregate(cur.rows, tf).length;
+    const oldView = view;
     cur.asset = j.asset; cur.date = j.date; cur.rows = j.candles || [];
-    view = null;  // new asset/date = full day again
+    if (keepView){
+      view = followView(oldView, oldTotal, aggregate(cur.rows, tf).length);
+    } else {
+      view = null;
+    }
     document.title = 'Candles — ' + cur.asset + ' ' + cur.date;
     history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date));
     $('dateInput').value = cur.date;
@@ -556,7 +578,7 @@ function setUpdated(){ $('updatedAt').textContent = 'Updated ' + dhakaNow().time
 function refreshIfToday(){
   if (!autoOn) return;
   if (cur.date !== dhakaNow().date) return;
-  loadAsset(cur.asset, cur.date);
+  loadAsset(cur.asset, cur.date, true);  // refresh keeps the zoom
 }
 
 const search = $('assetSearch'), list = $('assetList');

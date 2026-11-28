@@ -25,17 +25,29 @@ The viewer shows only candles (market data) — no password is ever shown.
 Demo (no DB needed, fake sample candles, just to see the page):
     python view_candles.py --demo
 
+Password protection (optional): set the VIEWER_PASSWORD environment
+variable in Render to any password you choose (never put it in the
+code or in GitHub). When it is set, every page and API request asks
+for HTTP Basic Auth (any username, that password). When it is unset,
+the viewer stays open exactly as before.
+
 UI: dark-ash premium theme, asset search, auto-refresh every 30s
-for today, live/stale badge, and a gap detector in the stats.
+for today, live/stale badge, gap detector, EMA 9/21 + RSI 14,
+best-time markers, compare mode, downloads, live forming candle,
+payouts, best time slots, signal generator and a bot status bar.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import hmac
 import html
 import json
+import math
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -48,6 +60,13 @@ except Exception:  # pragma: no cover
 UTC = timezone.utc
 
 DEFAULT_PORT = 8001
+LIVE_STALE_SECONDS = 10  # no tick for this long = STALE (same as the bot's live badge rule)
+
+# --- signal-engine constants, mirrored from bot/signal_engine.py ---
+MIN_BODY = 0.00025
+MIN_BODY_RATIO = 0.5
+MIN_BODY_REL = 0.0000125
+MIN_GAP_MINUTES = 7
 
 
 def normalize_asset(asset):
@@ -55,6 +74,14 @@ def normalize_asset(asset):
     a = (asset or "").strip().upper().replace("-", "_")
     if a.endswith("_OTC"):
         a = a[:-4] + "_otc"
+    return a
+
+
+def display_asset(asset):
+    """Internal 'USDMXN_otc' -> display 'USDMXN-OTC' (bot rule)."""
+    a = (asset or "").upper().strip()
+    if a.endswith("_OTC"):
+        a = a[:-4] + "-OTC"
     return a
 
 
@@ -67,6 +94,145 @@ def dhaka_date_range_utc(date_str):
 
 def today_dhaka_str():
     return datetime.now(DHAKA).strftime("%Y-%m-%d")
+
+
+def _parse_ts(ts):
+    """A DB ts value (datetime or UTC 'YYYY-MM-DD HH:MM:SS') -> aware UTC datetime."""
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+    return datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+
+
+def _utc_iso_to_dhaka(value):
+    """Stored UTC 'YYYY-MM-DD HH:MM:SS' -> Dhaka string, or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        return dt.astimezone(DHAKA).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _parse_tick_ts(value):
+    """A live-tick ts: unix seconds (int/float/numeric str) or a UTC
+    ISO string -> epoch seconds (int), or None when unreadable."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return int(datetime.strptime(s, fmt).replace(tzinfo=UTC).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def _fnum(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def hhmm_to_minutes(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+# ------------------------------------------------- signal math (bot mirror) ----
+def majority_vote(directions):
+    """Port of bot/signal_engine.py majority_vote (DOJI ignored,
+    tie -> direction None). Returns (direction, win_rate, calls, puts)."""
+    calls = sum(1 for d in directions if d == "CALL")
+    puts = sum(1 for d in directions if d == "PUT")
+    total = calls + puts
+    if total == 0:
+        return None, 0.0, calls, puts
+    if calls > puts:
+        return "CALL", calls / total, calls, puts
+    if puts > calls:
+        return "PUT", puts / total, calls, puts
+    return None, 0.5, calls, puts  # tie
+
+
+def _is_strong(candle, min_body=MIN_BODY, min_ratio=MIN_BODY_RATIO):
+    body = abs(candle["close"] - candle["open"])
+    rng = candle["high"] - candle["low"]
+    if rng <= 0:
+        return False
+    return body >= min_body and (body / rng) >= min_ratio
+
+
+def _is_strong_adaptive(candle):
+    price = abs(candle["close"]) or 1.0
+    return _is_strong(candle, min_body=price * MIN_BODY_REL)
+
+
+def _apply_strength_cascade(signals):
+    """Port of bot _apply_strength_cascade: strict first, then
+    price-scaled adaptive, then ratio-only 0.4, ratio-only 0.3,
+    then strongest by body/range ratio."""
+    strict = [s for s in signals if _is_strong(s["_candle"])]
+    if strict:
+        return strict
+    adaptive = [s for s in signals if _is_strong_adaptive(s["_candle"])]
+    if adaptive:
+        return adaptive
+
+    def _ratio_only(min_ratio):
+        out = []
+        for s in signals:
+            c = s["_candle"]
+            rng = c["high"] - c["low"]
+            if rng > 0 and abs(c["close"] - c["open"]) / rng >= min_ratio:
+                out.append(s)
+        return out
+
+    relaxed = _ratio_only(0.4)
+    if relaxed:
+        return relaxed
+    relaxed = _ratio_only(0.3)
+    if relaxed:
+        return relaxed
+
+    def _ratio(c):
+        rng = c["high"] - c["low"]
+        return abs(c["close"] - c["open"]) / rng if rng > 0 else 0.0
+
+    return sorted(signals, key=lambda s: -_ratio(s["_candle"]))
+
+
+def _apply_gap_filter(signals, min_gap=MIN_GAP_MINUTES):
+    """Port of bot apply_gap_filter: keep signals >= min_gap apart."""
+    kept = []
+    last_min = -10 ** 9
+    for s in sorted(signals, key=lambda x: x["hhmm"]):
+        mins = hhmm_to_minutes(s["hhmm"])
+        if mins - last_min >= min_gap:
+            kept.append(s)
+            last_min = mins
+    return kept
+
+
+def _annotate_strength(signals):
+    for s in signals:
+        c = s.get("_candle")
+        if c:
+            rng = c["high"] - c["low"]
+            s["strength"] = (abs(c["close"] - c["open"]) / rng) if rng > 0 else 0.0
+        else:
+            s["strength"] = 0.0
+        s.pop("_candle", None)
+    return signals
 
 
 # ---------------------------------------------------------------- DB ----
@@ -96,11 +262,21 @@ def connect_real():
 
 
 def connect_demo():
-    """Fake in-memory SQLite DB with sample candles — UI test only."""
+    """Fake in-memory SQLite DB with sample candles — UI test only.
+
+    Also seeds the bot's payouts + collector_state tables (same shape
+    as the real DB) so the new endpoints return sane demo JSON."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.execute(
         "CREATE TABLE candles (asset TEXT, ts TIMESTAMP, open REAL, "
         "high REAL, low REAL, close REAL, UNIQUE(asset, ts))"
+    )
+    conn.execute(
+        "CREATE TABLE payouts (asset TEXT PRIMARY KEY, payout_1m REAL, "
+        "is_open INTEGER NOT NULL DEFAULT 1, updated_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE collector_state (key TEXT PRIMARY KEY, value TEXT)"
     )
     base = datetime(2026, 11, 26, 0, 0, tzinfo=DHAKA).astimezone(UTC)
     price = 170.0
@@ -115,17 +291,50 @@ def connect_demo():
                  o, max(o, c) + 0.01, min(o, c) - 0.01, c),
             )
             p = c
+    now_utc = datetime.now(UTC)
+    conn.execute(
+        "INSERT INTO payouts VALUES (?,?,?,?)",
+        ("BTCUSD_otc", 93.0, 1, now_utc.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.execute(
+        "INSERT INTO payouts VALUES (?,?,?,?)",
+        ("USDMXN_otc", 91.0, 1, now_utc.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    flow = json.dumps({"stopped": [["EURUSD_otc", "11:13"]],
+                       "resumed": [["BTCUSD_otc", "11:20"]]})
+    state = {
+        "last_collection": (now_utc - timedelta(minutes=12)).strftime("%Y-%m-%d %H:%M:%S"),
+        "next_collection": (now_utc + timedelta(minutes=18)).strftime("%Y-%m-%d %H:%M:%S"),
+        "last_backfill": (now_utc - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        "quotex_last_login": (now_utc - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        "quotex_session": "connected",
+        "live_stream_status": "connected",
+        "live_stream_last_seen": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "live_stream_flow": flow,
+        "bot_on_free": "1",
+        "bot_on_premium": "1",
+    }
+    for k, v in state.items():
+        conn.execute("INSERT INTO collector_state VALUES (?,?)", (k, v))
     conn.commit()
     return conn
 
 
 class Store:
-    """One shared DB connection + the two queries the page needs."""
+    """One shared DB connection. READ-ONLY: every query here is a
+    SELECT (the demo seeder above is the only INSERT, and it writes
+    to a throwaway in-memory SQLite DB, never to the real candles)."""
 
     def __init__(self, conn, demo=False):
         self.conn = conn
         self.demo = demo
         self.ph = "?" if demo else "%s"
+
+    def _rollback(self):
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
 
     def assets(self):
         cur = self.conn.cursor()
@@ -145,16 +354,269 @@ class Store:
         )
         rows = []
         for ts, o, h, l, c in cur.fetchall():
-            if isinstance(ts, datetime):
-                dt = ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
-            else:
-                dt = datetime.strptime(str(ts), fmt).replace(tzinfo=UTC)
+            dt = _parse_ts(ts)
             rows.append({
                 "time": dt.astimezone(DHAKA).strftime("%H:%M"),
                 "open": float(o), "high": float(h),
                 "low": float(l), "close": float(c),
             })
         return asset, rows
+
+    def dates(self, asset=None):
+        """Dhaka dates that have candles (for one asset, or all)."""
+        try:
+            cur = self.conn.cursor()
+            if asset:
+                cur.execute(
+                    f"SELECT ts FROM candles WHERE asset = {self.ph} ORDER BY ts",
+                    (normalize_asset(asset),))
+            else:
+                cur.execute("SELECT ts FROM candles ORDER BY ts")
+            out = set()
+            for (ts,) in cur.fetchall():
+                out.add(_parse_ts(ts).astimezone(DHAKA).strftime("%Y-%m-%d"))
+            return sorted(out)
+        except Exception:
+            self._rollback()
+            return []
+
+    def get_state(self, key, default=None):
+        """One collector_state value (bot's DB state keys). None when
+        the table/key does not exist yet — never raises."""
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT value FROM collector_state WHERE key = {self.ph}",
+                (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+        except Exception:
+            self._rollback()
+            return default
+
+    def payouts(self):
+        """Bot's stored payouts (candles_db.get_payouts): the payouts
+        table, best payout first. [] when the collector never stored
+        a snapshot yet (or the table is missing)."""
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT asset, payout_1m, is_open, updated_at FROM payouts")
+            rows = [{"asset": a,
+                     "payout": float(p) if p is not None else None,
+                     "open": bool(o), "updated_at": u}
+                    for a, p, o, u in cur.fetchall()]
+            rows.sort(key=lambda r: (-(r["payout"] if r["payout"] is not None else -1),
+                                     r["asset"]))
+            return rows
+        except Exception:
+            self._rollback()
+            return []
+
+    def _demo_live_tick(self, asset):
+        """Demo only: a fresh rich-form forming candle every call, so
+        the live candle + countdown can be seen without a real bot.
+        (Real mode reads the bot's live_ticks DB state key instead.)"""
+        dates = self.dates(asset)
+        if not dates:
+            return {"asset": asset, "price": None, "ts": None, "stale": True}
+        _, rows = self.candles(asset, dates[-1])
+        if not rows:
+            return {"asset": asset, "price": None, "ts": None, "stale": True}
+        now = datetime.now(DHAKA)
+        base = rows[-1]["close"]
+        price = base + math.sin(time.time() / 7.0) * 0.001 * base
+        return {"asset": asset, "price": round(price, 5),
+                "ts": int(time.time()), "stale": False,
+                "minute": now.strftime("%Y-%m-%d %H:%M"),
+                "open": base, "high": max(base, price),
+                "low": min(base, price), "close": price, "demo": True}
+
+    def live_tick(self, asset):
+        """The bot's live tick for one asset, from the collector_state
+        key 'live_ticks' (published by the bot's live stream).
+
+        Two publisher forms are handled (the bot publisher is still
+        being built, so either may arrive):
+          simple: {asset: {"price": float, "ts": int}}
+          rich:   {asset: {"minute": "YYYY-MM-DD HH:MM", "open": ...,
+                           "high": ..., "low": ..., "close": ...,
+                           "ts": int}}
+        Returns {"asset", "price", "ts", "stale", "minute", "open",
+        "high", "low", "close"} — price null + stale true when the key
+        or the asset is missing (the viewer keeps working, the live
+        candle is simply hidden). Never raises."""
+        asset = normalize_asset(asset)
+        if self.demo:
+            return self._demo_live_tick(asset)
+        raw = self.get_state("live_ticks")
+        empty = {"asset": asset, "price": None, "ts": None, "stale": True,
+                 "minute": None, "open": None, "high": None,
+                 "low": None, "close": None}
+        if not raw:
+            return empty
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return empty
+        entry = None
+        if isinstance(data, dict):
+            for key in (asset, asset.upper(),
+                        asset.replace("_otc", "-OTC")):
+                if isinstance(data.get(key), dict):
+                    entry = data[key]
+                    break
+        if entry is None:
+            return empty
+        price = _fnum(entry.get("price", entry.get("close")))
+        ts = _parse_tick_ts(entry.get("ts"))
+        stale = True if ts is None else (time.time() - ts > LIVE_STALE_SECONDS)
+        return {"asset": asset, "price": price, "ts": ts, "stale": stale,
+                "minute": entry.get("minute"),
+                "open": _fnum(entry.get("open")),
+                "high": _fnum(entry.get("high")),
+                "low": _fnum(entry.get("low")),
+                "close": _fnum(entry.get("close"))}
+
+    def bot_status(self):
+        """Bot Status from the bot's DB state keys — the same keys
+        handlers._run_bot_status reads via collector.get_status_summary
+        (last/next collection, Quotex session/login, live stream
+        status + last seen) plus live_stream._FLOW_STATE_KEY
+        ('live_stream_flow': stopped/resumed assets) and the
+        bot_on_free / bot_on_premium toggles. Times are Dhaka."""
+        stopped, resumed = {}, []
+        raw_flow = self.get_state("live_stream_flow")
+        if raw_flow:
+            try:
+                data = json.loads(raw_flow)
+                stopped = {a: t for a, t in data.get("stopped", [])}
+                resumed = [[a, t] for a, t in data.get("resumed", [])]
+            except Exception:
+                stopped, resumed = {}, []
+        today = today_dhaka_str()
+        today_count = None
+        total = None
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM candles")
+            total = cur.fetchone()[0]
+            start, _ = dhaka_date_range_utc(today)
+            fmt = "%Y-%m-%d %H:%M:%S"
+            cur.execute(
+                f"SELECT COUNT(*) FROM candles WHERE ts >= {self.ph} "
+                f"AND ts < {self.ph}",
+                (start.strftime(fmt),
+                 datetime.now(UTC).strftime(fmt)))
+            today_count = cur.fetchone()[0]
+        except Exception:
+            self._rollback()
+        return {
+            "last_collection": _utc_iso_to_dhaka(self.get_state("last_collection")),
+            "next_collection": _utc_iso_to_dhaka(self.get_state("next_collection")),
+            "last_backfill": _utc_iso_to_dhaka(self.get_state("last_backfill")),
+            "quotex_last_login": _utc_iso_to_dhaka(self.get_state("quotex_last_login")),
+            "quotex_session": self.get_state("quotex_session"),
+            "live_stream_status": self.get_state("live_stream_status"),
+            "live_stream_last_seen": _utc_iso_to_dhaka(
+                self.get_state("live_stream_last_seen")),
+            "bot_on_free": self.get_state("bot_on_free", "1") != "0",
+            "bot_on_premium": self.get_state("bot_on_premium", "1") != "0",
+            "stopped": stopped,
+            "resumed": resumed,
+            "total_candles": total,
+            "today_date": today,
+            "today_count": today_count,
+            "dates": self.dates(),
+            "now_dhaka": datetime.now(DHAKA).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _vote_days(self, asset, ref_date, days):
+        """The `days` most recent COMPLETED dates before ref_date with
+        data for the asset (same idea as the bot's
+        available_signal_dates). Falls back to dates <= ref_date when
+        there is no completed day yet (first run / demo)."""
+        all_dates = self.dates(asset)
+        completed = [d for d in all_dates if d < ref_date]
+        pool = completed if completed else [d for d in all_dates if d <= ref_date]
+        return pool[-days:]
+
+    def _group_by_hhmm(self, asset, use_dates):
+        """{hhmm: {"dirs": [CALL/PUT...], "rep": last day's candle}}."""
+        by_minute = {}
+        for d in use_dates:
+            _, rows = self.candles(asset, d)
+            for r in rows:
+                slot = by_minute.setdefault(
+                    r["time"], {"dirs": [], "rep": r})
+                if r["close"] > r["open"]:
+                    slot["dirs"].append("CALL")
+                elif r["close"] < r["open"]:
+                    slot["dirs"].append("PUT")
+                slot["rep"] = r  # representative = latest day's candle
+        return by_minute
+
+    def best_times(self, asset, days=5, ref_date=None):
+        """Per-HH:MM majority-vote win rate over the past `days`
+        completed days (same logic as the bot's signal engine:
+        group by HH:MM across days, majority direction, win% =
+        majority/total). No strength filter here — the chart marks
+        every slot with win% >= 70%."""
+        asset = normalize_asset(asset)
+        ref_date = ref_date or today_dhaka_str()
+        use = self._vote_days(asset, ref_date, days)
+        by_minute = self._group_by_hhmm(asset, use)
+        slots = []
+        for hhmm in sorted(by_minute):
+            slot = by_minute[hhmm]
+            direction, win_rate, calls, puts = majority_vote(slot["dirs"])
+            if direction is None:
+                continue
+            slots.append({"hhmm": hhmm, "direction": direction,
+                          "win_rate": round(win_rate, 4),
+                          "win_pct": round(win_rate * 100, 1),
+                          "calls": calls, "puts": puts,
+                          "votes": calls + puts})
+        slots.sort(key=lambda s: (-s["win_rate"], s["hhmm"]))
+        return {"asset": asset, "ref_date": ref_date, "days": len(use),
+                "dates": use, "count": len(slots), "slots": slots}
+
+    def signals(self, asset, date_str, days=5, min_win_pct=70, apply_gap=True):
+        """Futures signals for `date_str`, built from the `days`
+        completed days before it — a simplified port of the bot's
+        generate_futures_signals_from_db: majority vote per HH:MM,
+        win-rate filter (multi-day only), the bot's strength cascade,
+        and the >= 7 min gap filter when apply_gap is True (default:
+        fewer, higher-accuracy signals, as the owner wants)."""
+        asset = normalize_asset(asset)
+        use = self._vote_days(asset, date_str, days)
+        n_days = len(use)
+        by_minute = self._group_by_hhmm(asset, use)
+        sigs = []
+        for hhmm in sorted(by_minute):
+            slot = by_minute[hhmm]
+            direction, win_rate, calls, puts = majority_vote(slot["dirs"])
+            if direction is None:
+                continue
+            if n_days >= 2 and win_rate < min_win_pct / 100.0:
+                continue
+            sigs.append({"asset": asset, "hhmm": hhmm,
+                         "direction": direction, "win_rate": round(win_rate, 4),
+                         "win_pct": round(win_rate * 100, 1),
+                         "calls": calls, "puts": puts,
+                         "days": n_days, "_candle": slot["rep"]})
+        sigs = _apply_strength_cascade(sigs)
+        if apply_gap:
+            sigs = _apply_gap_filter(sigs)
+        sigs = _annotate_strength(sigs)
+        for s in sigs:
+            s["line"] = (f"{display_asset(asset)},{s['hhmm']} M1 "
+                         f"{s['direction']}")
+            s["strength"] = round(s["strength"], 3)
+        return {"asset": asset, "date": date_str, "days": n_days,
+                "dates": use, "threshold_pct": min_win_pct,
+                "gap_applied": bool(apply_gap),
+                "count": len(sigs), "signals": sigs}
 
 
 STORE = None  # set in main()
@@ -178,10 +640,9 @@ def dir_pill(r):
         return '<span class="pill put">PUT</span>'
     return '<span class="pill doji">DOJI</span>'
 
-
 CSS = """
 :root{
-  --bg:#16161a; --panel:#222228; --panel2:#2b2b33; --border:#3a3a44;
+  --bg:#141417; --panel:#1f1f24; --panel2:#2a2a31; --border:#383842;
   --text:#edeef2; --muted:#9a9ca8;
   --violet:#8b5cf6; --cyan:#06b6d4; --green:#22c55e; --red:#f43f5e; --amber:#f59e0b;
 }
@@ -207,50 +668,68 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .auto-pill.off{background:rgba(255,255,255,.08);color:var(--muted)}
 .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .search{position:relative;flex:1;min-width:220px}
-.search input,.controls input[type=date]{width:100%;background:#17171b;border:1px solid var(--border);
+.search input,.controls input[type=date],.sig-form input,.sig-form select{width:100%;background:#17171b;border:1px solid var(--border);
   color:var(--text);border-radius:10px;padding:11px 12px;font-size:15px;outline:none}
-.search input:focus,.controls input[type=date]:focus{border-color:var(--cyan)}
+.search input:focus,.controls input[type=date]:focus,.sig-form input:focus,.sig-form select:focus{border-color:var(--cyan)}
 .asset-list{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;display:none;
   background:var(--panel2);border:1px solid var(--border);border-radius:10px;overflow:hidden;
   max-height:320px;overflow-y:auto;box-shadow:0 12px 30px rgba(0,0,0,.5)}
 .match{padding:10px 12px;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:14px}
 .match:hover{background:rgba(139,92,246,.18)}
 .match.empty{color:var(--muted);cursor:default}
+.match .pay{float:right;color:#4ade80;font-weight:700}
+.match .pay.closed{color:var(--muted)}
 .match-count{padding:8px 12px;color:var(--muted);font-size:12px;border-top:1px solid var(--border);
   position:sticky;bottom:0;background:var(--panel2)}
-.controls button{background:linear-gradient(135deg,var(--violet),var(--cyan));color:#fff;border:0;
+.controls button,.btn{background:linear-gradient(135deg,var(--violet),var(--cyan));color:#fff;border:0;
   border-radius:10px;padding:11px 22px;font-size:15px;font-weight:700;cursor:pointer}
-.controls button:hover{filter:brightness(1.12)}
+.controls button:hover,.btn:hover{filter:brightness(1.12)}
+.btn.ghost{background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:8px 14px;font-size:13px}
+.btn.ghost:hover{border-color:var(--cyan)}
+.btn.ghost.active{background:linear-gradient(135deg,var(--violet),var(--cyan));border-color:transparent;color:#fff}
 .auto-toggle{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px;cursor:pointer;white-space:nowrap}
 .auto-toggle input{accent-color:var(--violet);width:16px;height:16px}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:0 2px 12px;align-items:center;color:var(--muted);font-size:13px}
 .chip{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;
   padding:6px 12px;font-size:13px;cursor:pointer;font-family:ui-monospace,Menlo,monospace}
 .chip:hover{border-color:var(--cyan);color:#67e8f9}
+.chip .pay{color:#4ade80;font-weight:700}
 .err{color:#fb7185;margin:0 2px 12px;font-size:14px}
 .err:empty{display:none}
 .asset-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.asset-name{font-size:22px;font-weight:800;font-family:ui-monospace,Menlo,monospace}
-.asset-date{color:var(--muted);font-size:13px;margin-top:2px}
-.asset-head-right{display:flex;align-items:center;gap:12px}
-.badge{padding:5px 12px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.5px}
+.asset-name{font-size:30px;font-weight:800;font-family:ui-monospace,Menlo,monospace;letter-spacing:.5px;line-height:1.1}
+.asset-date{color:var(--muted);font-size:13px;margin-top:4px}
+.payout-line{color:#4ade80;font-size:13px;font-weight:700;margin-top:4px;font-family:ui-monospace,Menlo,monospace}
+.payout-line:empty{display:none}
+.asset-head-right{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.head-price{text-align:right}
+.head-label{color:var(--muted);font-size:10px;letter-spacing:2px}
+.last-price{font-family:ui-monospace,Menlo,monospace;font-size:30px;font-weight:800;line-height:1.15;font-variant-numeric:tabular-nums}
+.last-price.up{color:#4ade80}
+.last-price.down{color:#fb7185}
+.chg-line{font-family:ui-monospace,Menlo,monospace;font-size:16px;font-weight:700}
+.chg-line.up{color:#4ade80}
+.chg-line.down{color:#fb7185}
+.badge{padding:5px 12px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.5px;white-space:nowrap}
 .badge.live{background:rgba(34,197,94,.18);color:#4ade80;animation:pulse 1.6s infinite}
 .badge.delayed{background:rgba(245,158,11,.18);color:#fbbf24}
 .badge.stale{background:rgba(244,63,94,.18);color:#fb7185}
 .badge.hist{background:rgba(255,255,255,.08);color:var(--muted)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
-.last-price{font-family:ui-monospace,Menlo,monospace;font-size:19px;font-weight:700}
-.last-price.up{color:#4ade80}
-.last-price.down{color:#fb7185}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px}
 .stat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
 .stat .label{color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase}
-.stat .value{font-size:20px;font-weight:700;margin-top:4px;font-family:ui-monospace,Menlo,monospace}
+.stat .value{font-size:20px;font-weight:700;margin-top:4px;font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
 .status-line{display:flex;gap:16px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:13px}
 .status-line .ok{color:#4ade80}
 .status-line .warn{color:#fbbf24}
 .auto-progress{width:120px;height:6px;border-radius:99px;background:#33333c;overflow:hidden;display:inline-block;vertical-align:middle}
 .auto-progress span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--violet),var(--cyan))}
+.bot-status{font-size:13px;line-height:1.9;color:var(--muted)}
+.bot-status b{color:var(--text)}
+.bot-status .ok{color:#4ade80}
+.bot-status .warn{color:#fbbf24}
+.bot-status .bad{color:#fb7185}
 .chart-card{padding:10px 12px}
 .chart-toolbar{display:flex;gap:8px;align-items:center;margin:2px 4px 10px;flex-wrap:wrap}
 .chart-toolbar .title{font-weight:700;font-size:13px;letter-spacing:1px;color:var(--muted);margin-right:4px}
@@ -260,24 +739,51 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
 .tf-btn.active{background:linear-gradient(135deg,var(--violet),var(--cyan));border-color:transparent;color:#fff}
 .zoom-btn{font-size:15px;padding:5px 12px}
 canvas{width:100%;height:240px;display:block;cursor:grab;touch-action:none}
-canvas{width:100%;height:240px;display:block}
+#rsi{height:96px;cursor:default}
+.marker-note{color:var(--muted);font-size:12px;margin:6px 4px 0}
+.marker-note b{color:#4ade80}
+.marker-note i{color:#fb7185;font-style:normal}
+.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin:8px 4px 0}
+.legend span b{font-family:ui-monospace,Menlo,monospace}
+.sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
 .table-card{padding:6px 0 10px;overflow-x:auto}
 table{border-collapse:collapse;width:100%;min-width:560px}
-td,th{padding:7px 12px;text-align:right;font-family:ui-monospace,Menlo,monospace;font-size:13px;border-bottom:1px solid #2e2e36}
+td,th{padding:7px 12px;text-align:right;font-family:ui-monospace,Menlo,monospace;font-size:13px;border-bottom:1px solid #2e2e36;font-variant-numeric:tabular-nums}
 td:first-child,th:first-child{text-align:left}
 thead th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-size:11px;letter-spacing:1px;text-transform:uppercase}
 tbody tr:nth-child(even){background:rgba(255,255,255,.02)}
 tbody tr:hover{background:rgba(139,92,246,.08)}
+tr.gap-row td{background:rgba(244,63,94,.16);color:#fb7185;text-align:center !important;font-size:12px;font-weight:700;letter-spacing:.5px}
 .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
 .pill.call{background:rgba(34,197,94,.15);color:#4ade80}
 .pill.put{background:rgba(244,63,94,.15);color:#fb7185}
 .pill.doji{background:rgba(245,158,11,.15);color:#fbbf24}
 .empty{color:var(--muted);text-align:center !important;padding:18px !important}
 .row-count{color:var(--muted);font-size:12px;margin:10px 14px 0}
+.dl-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 14px 10px}
+.panel-title{font-weight:700;font-size:13px;letter-spacing:1px;color:var(--muted);margin:0 0 10px}
+.best-list{display:flex;flex-direction:column;gap:6px}
+.best-row{display:flex;align-items:center;gap:10px;font-family:ui-monospace,Menlo,monospace;font-size:14px}
+.best-row .t{width:56px;font-weight:700}
+.best-row .bar{flex:1;height:8px;border-radius:99px;background:#33333c;overflow:hidden}
+.best-row .bar span{display:block;height:100%;background:linear-gradient(90deg,var(--violet),var(--cyan))}
+.best-row .w{width:96px;text-align:right}
+.best-row .v{width:64px;text-align:right;color:var(--muted);font-size:12px}
+.sig-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.sig-form input,.sig-form select{width:auto;min-width:110px;padding:9px 10px;font-size:14px}
+.sig-form label{color:var(--muted);font-size:12px}
+.sig-list{font-family:ui-monospace,Menlo,monospace;font-size:14px;line-height:2}
+.sig-list .win{color:#4ade80}
+.cmp-picker{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.cmp-picker select{background:#17171b;border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 10px;font-size:14px;outline:none}
+.cmp-tag{background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:5px 6px 5px 12px;font-size:13px;font-family:ui-monospace,Menlo,monospace}
+.cmp-tag button{background:none;border:0;color:#fb7185;cursor:pointer;font-size:14px;padding:0 4px}
+#cmp{height:220px;cursor:default}
 footer{color:var(--muted);font-size:12px;text-align:center;margin-top:18px;line-height:1.7}
 @media (max-width:640px){
   .brand h1{font-size:17px}
-  .asset-name{font-size:18px}
+  .asset-name{font-size:22px}
+  .last-price{font-size:22px}
   .controls button{width:100%}
 }
 """
@@ -296,6 +802,7 @@ function fmtPrice(v){
   if (v >= 100) return v.toFixed(3);
   return v.toFixed(5);
 }
+function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function toMin(t){ const p = t.split(':'); return (+p[0]) * 60 + (+p[1]); }
 function toHHMM(m){ return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }
 function dirOf(r){ return r.close > r.open ? 'CALL' : (r.close < r.open ? 'PUT' : 'DOJI'); }
@@ -327,7 +834,8 @@ function dhakaNow(){
   const d = new Date();
   const time = d.toLocaleTimeString('en-GB', {timeZone: 'Asia/Dhaka', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false});
   const date = d.toLocaleDateString('en-CA', {timeZone: 'Asia/Dhaka'});
-  return {time: time, date: date, min: (+time.slice(0, 2)) * 60 + (+time.slice(3, 5))};
+  return {time: time, date: date, hhmm: time.slice(0, 5), second: +time.slice(6, 8),
+          min: (+time.slice(0, 2)) * 60 + (+time.slice(3, 5))};
 }
 function statusOf(rows){
   const now = dhakaNow();
@@ -340,58 +848,152 @@ function statusOf(rows){
   return {cls: 'stale', label: 'STALE ' + diff + 'm'};
 }
 
+// --- EMA / RSI: exact ports of bot/signal_engine.py ema() and rsi() ---
+// ema: k = 2/(period+1), seeded with values[0], full-length series.
+// rsi: trailing value over the last `period` diffs; 50.0 when fewer
+// than period+1 closes, 100.0 when avg loss is 0.
+function emaSeries(values, period){
+  const out = [];
+  if (!values.length) return out;
+  const k = 2 / (period + 1);
+  let e = values[0];
+  for (const v of values){ e = v * k + e * (1 - k); out.push(e); }
+  return out;
+}
+function rsiValue(closes, period){
+  if (closes.length < period + 1) return 50.0;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++){
+    const diff = closes[closes.length - i] - closes[closes.length - i - 1];
+    if (diff > 0) gains += diff; else losses += -diff;
+  }
+  const avgGain = gains / period, avgLoss = losses / period;
+  if (avgLoss === 0) return 100.0;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+function rsiSeries(closes, period){
+  const out = [];
+  for (let i = 0; i < closes.length; i++) out.push(rsiValue(closes.slice(0, i + 1), period));
+  return out;
+}
+
 let tf = 15;  // chart timeframe in minutes (1 / 5 / 15 / 60)
+let payouts = {};       // asset -> {payout, open, updated_at}
+let bestSlots = [];     // /api/best_times slots for the current asset
+let liveTick = null;    // last /api/live_tick result {price, ts, stale}
+let liveCandle = null;  // forming candle {minute HH:MM, open, high, low, close}
 
 function aggregate(rows, tfMin){
   // Group 1-min rows into tfMin-minute candles, aligned to the day:
   // open = first open, high = max high, low = min low, close = last close.
-  // The last (in-progress) bucket is included — it is the live candle.
-  if (tfMin <= 1) return rows;
+  if (tfMin <= 1) return rows.map(r => Object.assign({}, r, {bucket: toMin(r.time), min: toMin(r.time)}));
   const out = [];
   let curB = null;
   rows.forEach(r => {
     const b = Math.floor(toMin(r.time) / tfMin);
     if (!curB || curB.bucket !== b){
-      curB = {bucket: b, time: r.time, open: r.open, high: r.high, low: r.low, close: r.close};
+      curB = {bucket: b, min: b * tfMin, time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, live: !!r.live};
       out.push(curB);
     } else {
       if (r.high > curB.high) curB.high = r.high;
       if (r.low < curB.low) curB.low = r.low;
       curB.close = r.close;
+      if (r.live) curB.live = true;
     }
   });
   return out;
 }
 
-function drawChart(rows){
+function liveRow(){
+  return {time: liveCandle.minute, open: liveCandle.open, high: liveCandle.high,
+          low: liveCandle.low, close: liveCandle.close, live: true};
+}
+// Closed candles + the forming live candle (only for today).
+function displayRows(){
+  const rows = cur.rows;
+  if (!liveCandle || cur.date !== dhakaNow().date) return rows;
+  const lm = liveCandle.minute;
+  if (!rows.length) return [liveRow()];
+  const last = rows[rows.length - 1];
+  if (lm > last.time) return rows.concat([liveRow()]);
+  if (lm === last.time){ const cp = rows.slice(); cp[cp.length - 1] = liveRow(); return cp; }
+  return rows;  // tick minute is behind the closed data — ignore it
+}
+function aggRows(){ return aggregate(displayRows(), tf); }
+
+function isTickStale(){
+  return !liveTick || liveTick.ts == null || (Date.now() / 1000 - liveTick.ts > 10);
+}
+function headerPrice(){
+  if (liveTick && liveTick.price != null && !isTickStale()) return liveTick.price;
+  const rows = cur.rows;
+  return rows.length ? rows[rows.length - 1].close : null;
+}
+
+function drawChart(){
   const cv = $('ch'), ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
   ctx.clearRect(0, 0, W, H);
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-  ctx.lineWidth = 1;
-  for (let i = 1; i < 4; i++){ const y = H * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  const all = aggregate(rows, tf);
-  const candles = view ? all.slice(Math.max(0, Math.floor(view[0])), Math.min(all.length, Math.ceil(view[1]))) : all;
+  const all = aggRows();
+  const total = all.length;
+  let a = 0, b = total;
+  if (view){ a = Math.max(0, Math.floor(view[0])); b = Math.min(total, Math.ceil(view[1])); }
+  const candles = all.slice(a, b);
   if (candles.length < 2){
     ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
     ctx.fillText('No data to chart', 16, H / 2);
+    drawRSI();
     return;
   }
   let mn = Infinity, mx = -Infinity;
   candles.forEach(c => { if (c.low < mn) mn = c.low; if (c.high > mx) mx = c.high; });
   const rg = (mx - mn) || 1;
-  const padL = 8, padR = 8, padT = 14, padB = 22;
+  const padL = 8, padR = 62, padT = 16, padB = 22;
   const slotW = (W - padL - padR) / candles.length;
   const bodyW = Math.max(1, Math.floor(slotW * 0.7));
   const X = i => padL + i * slotW + slotW / 2;
   const Y = v => padT + (1 - (v - mn) / rg) * (H - padT - padB);
+  // grid + price labels on the right
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.fillStyle = '#9a9ca8'; ctx.font = '11px system-ui'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++){
+    const v = mn + rg * i / 4, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR + 6, y); ctx.stroke();
+    ctx.fillText(fmtPrice(v), W - padR + 10, y + 4);
+  }
+  // red gap bands: aggregated buckets that contain missing minutes
+  const gaps = computeGaps(cur.rows);
+  if (gaps.count){
+    const bmap = {};
+    all.forEach((c, i) => { bmap[c.bucket] = i; });
+    const missIdx = new Set();
+    gaps.ranges.forEach(r => {
+      for (let m = r[0]; m <= r[1]; m++){
+        const idx = bmap[Math.floor(m / tf)];
+        if (idx !== undefined) missIdx.add(idx);
+      }
+    });
+    ctx.fillStyle = 'rgba(244,63,94,0.13)';
+    let run = null;
+    const flush = end => {
+      if (run === null) return;
+      const x0 = padL + (run - a) * slotW, x1 = padL + (end - a) * slotW;
+      ctx.fillRect(x0, padT, Math.max(2, x1 - x0), H - padT - padB);
+      run = null;
+    };
+    for (let i = a; i < b; i++){
+      if (missIdx.has(i)){ if (run === null) run = i; }
+      else flush(i);
+    }
+    flush(b);
+  }
+  // candles
   candles.forEach((c, i) => {
     const col = c.close > c.open ? '#22c55e' : (c.close < c.open ? '#f43f5e' : '#f59e0b');
     const x = X(i);
-    // wick: high to low
     ctx.strokeStyle = col; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(x, Y(c.high)); ctx.lineTo(x, Y(c.low)); ctx.stroke();
-    // body: open to close (doji = a flat line)
     const yO = Y(c.open), yC = Y(c.close);
     ctx.fillStyle = col;
     if (Math.abs(yO - yC) < 1){
@@ -399,14 +1001,88 @@ function drawChart(rows){
     } else {
       ctx.fillRect(x - bodyW / 2, Math.min(yO, yC), bodyW, Math.abs(yO - yC));
     }
+    // forming live candle: dashed outline so it reads as "not closed yet"
+    if (c.live){
+      ctx.strokeStyle = '#e5e7eb'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      ctx.strokeRect(x - bodyW / 2 - 1.5, Math.min(Y(c.high), Y(c.low)) - 2, bodyW + 3,
+        Math.abs(Y(c.high) - Y(c.low)) + 4);
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#e5e7eb'; ctx.font = 'bold 10px system-ui';
+      ctx.fillText('LIVE', Math.max(4, x - 12), Math.max(12, Y(c.high) - 6));
+    }
+  });
+  // EMA 9 (cyan) + EMA 21 (violet) over the full day's closes
+  const closesAll = all.map(c => c.close);
+  const e9 = emaSeries(closesAll, 9), e21 = emaSeries(closesAll, 21);
+  [['#06b6d4', e9], ['#a78bfa', e21]].forEach(pair => {
+    const col = pair[0], series = pair[1];
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
+    let started = false;
+    for (let i = a; i < b; i++){
+      const x = X(i - a), y = Y(series[i]);
+      if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
+  // best-time markers: win% >= 70% slots as CALL/PUT triangles
+  const bmap2 = {};
+  all.forEach((c, i) => { bmap2[c.bucket] = i; });
+  bestSlots.forEach(s => {
+    if (s.win_rate < 0.70) return;
+    const idx = bmap2[Math.floor(toMin(s.hhmm) / tf)];
+    if (idx === undefined || idx < a || idx >= b) return;
+    const c = all[idx], x = X(idx - a);
+    ctx.font = 'bold 10px system-ui';
+    if (s.direction === 'CALL'){
+      ctx.fillStyle = '#4ade80';
+      ctx.beginPath(); ctx.moveTo(x, Y(c.high) - 12); ctx.lineTo(x - 5, Y(c.high) - 4); ctx.lineTo(x + 5, Y(c.high) - 4); ctx.closePath(); ctx.fill();
+      ctx.fillText(s.win_pct + '%', x - 12, Math.max(10, Y(c.high) - 15));
+    } else {
+      ctx.fillStyle = '#fb7185';
+      ctx.beginPath(); ctx.moveTo(x, Y(c.low) + 12); ctx.lineTo(x - 5, Y(c.low) + 4); ctx.lineTo(x + 5, Y(c.low) + 4); ctx.closePath(); ctx.fill();
+      ctx.fillText(s.win_pct + '%', x - 12, Math.min(H - 24, Y(c.low) + 24));
+    }
   });
   const last = candles[candles.length - 1];
   const lastCol = last.close > last.open ? '#22c55e' : (last.close < last.open ? '#f43f5e' : '#f59e0b');
   ctx.fillStyle = '#9a9ca8'; ctx.font = '12px system-ui';
   ctx.fillText(candles[0].time, 10, H - 6);
-  ctx.fillText(last.time, W - 46, H - 6);
+  ctx.fillText(last.time, W - padR - 36, H - 6);
   ctx.fillStyle = lastCol; ctx.font = 'bold 13px system-ui';
   ctx.fillText(fmtPrice(last.close), Math.max(10, X(candles.length - 1) - 70), Math.max(16, Y(last.close) - 10));
+  drawRSI();
+}
+
+function drawRSI(){
+  const cv = $('rsi');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const all = aggRows();
+  if (all.length < 2){
+    ctx.fillStyle = '#9a9ca8'; ctx.font = '13px system-ui';
+    ctx.fillText('RSI needs at least 2 candles', 16, H / 2);
+    return;
+  }
+  const vals = rsiSeries(all.map(c => c.close), 14);
+  const Y = v => 8 + (1 - v / 100) * (H - 16);
+  ctx.fillStyle = 'rgba(244,63,94,0.06)'; ctx.fillRect(0, 8, W, Y(70) - 8);
+  ctx.fillStyle = 'rgba(34,197,94,0.06)'; ctx.fillRect(0, Y(30), W, H - 8 - Y(30));
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
+  [70, 50, 30].forEach(v => { ctx.beginPath(); ctx.moveTo(0, Y(v)); ctx.lineTo(W, Y(v)); ctx.stroke(); });
+  ctx.fillStyle = '#9a9ca8'; ctx.font = '11px system-ui';
+  ctx.fillText('70', 6, Y(70) - 3); ctx.fillText('50', 6, Y(50) - 3); ctx.fillText('30', 6, Y(30) - 3);
+  ctx.strokeStyle = '#06b6d4'; ctx.lineWidth = 1.5; ctx.beginPath();
+  vals.forEach((v, i) => {
+    const x = 8 + i * (W - 16) / Math.max(1, vals.length - 1), y = Y(v);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  const last = vals[vals.length - 1];
+  ctx.fillStyle = last >= 50 ? '#4ade80' : '#fb7185';
+  ctx.font = 'bold 13px system-ui';
+  ctx.fillText('RSI 14: ' + last.toFixed(1), W - 110, 18);
 }
 
 document.querySelectorAll('.tf-btn[data-tf]').forEach(b => {
@@ -415,7 +1091,7 @@ document.querySelectorAll('.tf-btn[data-tf]').forEach(b => {
     b.classList.add('active');
     tf = parseInt(b.dataset.tf, 10) || 15;
     view = null;  // new timeframe = full day again
-    drawChart(cur.rows);
+    drawChart();
   });
 });
 
@@ -445,7 +1121,7 @@ function panView(a, b, total, delta){
 }
 function setView(nv, total){
   view = (nv[1] - nv[0] >= total - 0.5) ? null : nv;
-  drawChart(cur.rows);
+  drawChart();
 }
 // After new candles arrive, where should the zoomed view go? If it
 // was pinned to the live (right) edge, slide it right by the new
@@ -459,7 +1135,7 @@ function followView(view, oldTotal, newTotal){
   return [newTotal - len, newTotal];
 }
 function zoomCenter(factor){
-  const total = aggregate(cur.rows, tf).length;
+  const total = aggRows().length;
   if (total < 2) return;
   let a = 0, b = total;
   if (view){ a = view[0]; b = view[1]; }
@@ -467,7 +1143,7 @@ function zoomCenter(factor){
 }
 $('zoomIn').addEventListener('click', () => zoomCenter(0.7));
 $('zoomOut').addEventListener('click', () => zoomCenter(1.4));
-$('zoomReset').addEventListener('click', () => { view = null; drawChart(cur.rows); });
+$('zoomReset').addEventListener('click', () => { view = null; drawChart(); });
 
 const cvEl = $('ch');
 function canvasX(clientX){
@@ -476,7 +1152,7 @@ function canvasX(clientX){
 }
 cvEl.addEventListener('wheel', e => {
   e.preventDefault();
-  const total = aggregate(cur.rows, tf).length;
+  const total = aggRows().length;
   if (total < 2) return;
   let a = 0, b = total;
   if (view){ a = view[0]; b = view[1]; }
@@ -493,7 +1169,7 @@ function dragStart(clientX){
 }
 function dragMove(clientX){
   if (!drag) return;
-  const total = aggregate(cur.rows, tf).length;
+  const total = aggRows().length;
   if (total < 2) return;
   let a = 0, b = total;
   if (drag.view){ a = drag.view[0]; b = drag.view[1]; }
@@ -509,6 +1185,33 @@ cvEl.addEventListener('touchstart', e => { if (e.touches.length === 1) dragStart
 cvEl.addEventListener('touchmove', e => { if (e.touches.length === 1){ e.preventDefault(); dragMove(e.touches[0].clientX); } }, {passive: false});
 cvEl.addEventListener('touchend', dragEnd);
 
+function updateBadge(){
+  const b = $('liveBadge');
+  if (liveTick && liveTick.price != null){
+    if (!isTickStale()){ b.className = 'badge live'; b.textContent = '● LIVE'; return; }
+    b.className = 'badge stale'; b.textContent = 'STALE — no tick 10s+'; return;
+  }
+  const st = statusOf(cur.rows);
+  b.className = 'badge ' + st.cls; b.textContent = st.label;
+}
+
+function updateHeaderPrice(){
+  const rows = cur.rows;
+  const lp = $('lastPrice'), chg = $('chgLine');
+  const price = headerPrice();
+  const firstO = rows.length ? rows[0].open : null;
+  if (price !== null && price !== undefined){
+    lp.textContent = fmtPrice(price);
+    if (firstO !== null && firstO !== 0){
+      const pct = (price - firstO) / firstO * 100;
+      const up = pct >= 0;
+      lp.className = 'last-price ' + (up ? 'up' : 'down');
+      chg.textContent = (up ? '▲ +' : '▼ ') + pct.toFixed(2) + '% vs day open';
+      chg.className = 'chg-line ' + (up ? 'up' : 'down');
+    } else { lp.className = 'last-price'; chg.textContent = ''; }
+  } else { lp.textContent = '—'; lp.className = 'last-price'; chg.textContent = ''; }
+}
+
 function renderAll(){
   const rows = cur.rows;
   $('statCount').textContent = rows.length;
@@ -520,26 +1223,30 @@ function renderAll(){
     $('statHigh').textContent = fmtPrice(hi);
     $('statLow').textContent = fmtPrice(lo);
   } else { $('statHigh').textContent = '—'; $('statLow').textContent = '—'; }
-  const st = statusOf(rows);
-  const b = $('liveBadge'); b.className = 'badge ' + st.cls; b.textContent = st.label;
+  updateBadge();
   $('gapsLine').innerHTML = 'Gaps: ' + gapsText(computeGaps(rows));
   $('assetTitle').textContent = cur.asset;
   $('dateTitle').textContent = cur.date + ' (Dhaka time)';
-  const lastP = rows.length ? rows[rows.length - 1].close : null;
-  const firstO = rows.length ? rows[0].open : null;
-  const lp = $('lastPrice');
-  if (lastP !== null){
-    lp.textContent = (lastP >= firstO ? '▲ ' : '▼ ') + fmtPrice(lastP);
-    lp.className = 'last-price ' + (lastP >= firstO ? 'up' : 'down');
-  } else { lp.textContent = '—'; lp.className = 'last-price'; }
+  const p = payouts[cur.asset];
+  $('payoutLine').textContent = (p && p.payout != null)
+    ? ('Payout ' + p.payout + '%' + (p.open === false ? ' (closed)' : '')) : '';
+  updateHeaderPrice();
   let h = '';
+  let prevMin = null;
   rows.forEach(r => {
+    const m = toMin(r.time);
+    if (prevMin !== null && m - prevMin > 1){
+      const n = m - prevMin - 1;
+      h += '<tr class="gap-row"><td colspan="6">GAP — ' + n + ' min missing (' +
+        toHHMM(prevMin + 1) + (n > 1 ? ' – ' + toHHMM(m - 1) : '') + ')</td></tr>';
+    }
+    prevMin = m;
     h += '<tr><td>' + r.time + '</td><td>' + fmtPrice(r.open) + '</td><td>' + fmtPrice(r.high) +
       '</td><td>' + fmtPrice(r.low) + '</td><td>' + fmtPrice(r.close) + '</td><td>' + pillOf(r) + '</td></tr>';
   });
   $('tbody').innerHTML = h || '<tr><td colspan="6" class="empty">No candles for this asset on this date.</td></tr>';
   $('rowCount').textContent = rows.length + ' candles';
-  drawChart(rows);
+  drawChart();
 }
 
 async function loadAsset(asset, date, keepView){
@@ -554,21 +1261,24 @@ async function loadAsset(asset, date, keepView){
     // null every time, so the chart zoomed out whenever a new candle
     // arrived. Now a refresh (keepView) keeps the zoom; only a real
     // asset/date change resets to the full day.
-    const oldTotal = aggregate(cur.rows, tf).length;
+    const oldTotal = aggRows().length;
     const oldView = view;
     cur.asset = j.asset; cur.date = j.date; cur.rows = j.candles || [];
     if (keepView){
-      view = followView(oldView, oldTotal, aggregate(cur.rows, tf).length);
+      view = followView(oldView, oldTotal, aggRows().length);
     } else {
-      view = null;
+      view = null; liveCandle = null; liveTick = null;
     }
     document.title = 'Candles — ' + cur.asset + ' ' + cur.date;
     history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date));
     $('dateInput').value = cur.date;
+    $('sigAsset').value = cur.asset; $('sigDate').value = cur.date;
     $('errLine').textContent = cur.rows.length ? '' : 'No candles for this asset on this date — try another date.';
     renderAll();
     setUpdated();
     countdown = 30;
+    loadBestTimes();
+    pollLiveTick();
   } catch (e){
     $('errLine').textContent = 'Could not load candles — check connection and retry.';
   }
@@ -581,12 +1291,251 @@ function refreshIfToday(){
   loadAsset(cur.asset, cur.date, true);  // refresh keeps the zoom
 }
 
+// --- payouts: shown in search dropdown, quick chips and the header ---
+async function loadPayouts(){
+  try {
+    const r = await fetch('/api/payouts');
+    const j = await r.json();
+    (j.payouts || []).forEach(p => { payouts[p.asset] = p; });
+    document.querySelectorAll('.chip').forEach(c => {
+      const p = payouts[c.dataset.a];
+      if (p && p.payout != null && !c.querySelector('.pay')){
+        c.innerHTML = esc(c.dataset.a) + ' <span class="pay">' + p.payout + '%</span>';
+      }
+    });
+    renderAll();
+  } catch (e){ /* payouts are a bonus — the viewer works without them */ }
+}
+function payLabel(a){
+  const p = payouts[a];
+  if (!p || p.payout == null) return '';
+  return '<span class="pay' + (p.open === false ? ' closed' : '') + '">' + p.payout + '%</span>';
+}
+
+// --- best times: chart markers + best-slot panel ---
+async function loadBestTimes(){
+  try {
+    const r = await fetch('/api/best_times?asset=' + encodeURIComponent(cur.asset) +
+      '&days=5&date=' + encodeURIComponent(cur.date));
+    const j = await r.json();
+    bestSlots = j.slots || [];
+    renderBestPanel(j);
+    drawChart();
+  } catch (e){ /* markers are a bonus — the chart works without them */ }
+}
+function renderBestPanel(j){
+  const el = $('bestList');
+  const top = (j.slots || []).slice(0, 10);
+  $('bestMeta').textContent = 'Based on ' + j.days + ' day(s): ' + (j.dates || []).join(', ') +
+    ' — win% = majority votes for that HH:MM across those days';
+  if (!top.length){
+    el.innerHTML = '<div class="empty">No best-time slots yet — need past days of data for this asset.</div>';
+    return;
+  }
+  el.innerHTML = top.map(s =>
+    '<div class="best-row"><span class="t">' + s.hhmm + '</span>' +
+    '<span class="pill ' + s.direction.toLowerCase() + '">' + s.direction + '</span>' +
+    '<span class="bar"><span style="width:' + s.win_pct + '%"></span></span>' +
+    '<span class="w">' + s.win_pct + '%</span>' +
+    '<span class="v">' + s.calls + 'C / ' + s.puts + 'P</span></div>'
+  ).join('');
+}
+
+// --- bot status bar ---
+async function loadBotStatus(){
+  try {
+    const r = await fetch('/api/bot_status');
+    const j = await r.json();
+    const stopped = Object.entries(j.stopped || {}).map(e => esc(e[0]) + ' (' + esc(e[1]) + ')').join(', ') || 'none';
+    const resumed = (j.resumed || []).map(e => esc(e[0]) + ' (' + esc(e[1]) + ')').join(', ') || 'none';
+    $('botStatus').innerHTML =
+      '<b>Last collection:</b> ' + esc(j.last_collection || '—') +
+      ' &nbsp; <b>Next:</b> ' + esc(j.next_collection || '—') + '<br>' +
+      '<b>Live stream:</b> <span class="' + (j.live_stream_status === 'connected' ? 'ok' : 'warn') + '">' +
+      esc(j.live_stream_status || 'not running') + '</span>' +
+      ' — last candle ' + esc(j.live_stream_last_seen || '—') + '<br>' +
+      '<b>Stopped:</b> <span class="bad">' + stopped + '</span>' +
+      ' &nbsp; <b>Resumed:</b> <span class="ok">' + resumed + '</span><br>' +
+      '<b>Quotex:</b> ' + esc(j.quotex_session || '—') +
+      ' &nbsp; <b>Last login:</b> ' + esc(j.quotex_last_login || '—') +
+      ' &nbsp; <b>Bot:</b> free ' + (j.bot_on_free ? 'ON' : 'OFF') +
+      ' / premium ' + (j.bot_on_premium ? 'ON' : 'OFF') +
+      (j.total_candles != null ? ' &nbsp; <b>DB:</b> ' + j.total_candles + ' candles' : '');
+  } catch (e){
+    $('botStatus').textContent = 'Bot status unavailable — the bot may not have written its state yet.';
+  }
+}
+
+// --- live tick (Fix 11): 1s poll, forming candle, countdown ---
+async function pollLiveTick(){
+  if (!cur.asset) return;
+  try {
+    const r = await fetch('/api/live_tick?asset=' + encodeURIComponent(cur.asset));
+    handleTick(await r.json());
+  } catch (e){ /* keep the last tick state; the badge falls back to candle status */ }
+}
+function handleTick(j){
+  if (!j || j.price == null || j.ts == null){
+    liveTick = null; liveCandle = null; updateBadge(); return;
+  }
+  liveTick = {price: j.price, ts: j.ts, stale: !!j.stale};
+  const now = dhakaNow();
+  if (cur.date !== now.date){ liveCandle = null; updateBadge(); updateHeaderPrice(); return; }
+  if (j.open != null && j.high != null && j.low != null && j.close != null){
+    // Rich forming-candle form: the bot already tracked OHLC.
+    let minute = (j.minute || '').slice(11, 16) || now.hhmm;
+    if (j.minute && j.minute.slice(0, 10) !== cur.date) minute = now.hhmm;
+    liveCandle = {minute: minute, open: j.open, high: j.high, low: j.low, close: j.close};
+  } else {
+    // Simple price-only form: track high/low client-side;
+    // open = the last closed candle's close.
+    const minute = now.hhmm;
+    if (!liveCandle || liveCandle.minute !== minute){
+      const last = cur.rows[cur.rows.length - 1];
+      const open = last ? last.close : j.price;
+      liveCandle = {minute: minute, open: open, high: j.price, low: j.price, close: j.price};
+    } else {
+      if (j.price > liveCandle.high) liveCandle.high = j.price;
+      if (j.price < liveCandle.low) liveCandle.low = j.price;
+      liveCandle.close = j.price;
+    }
+  }
+  updateHeaderPrice();
+  updateBadge();
+  drawChart();
+}
+
+// --- compare 2–3 assets (normalized % change, indexed to 100) ---
+const CMP_COLORS = ['#22c55e', '#06b6d4', '#a78bfa'];
+let compareAssets = [];
+let compareRows = {};
+function renderCmpTags(){
+  $('cmpTags').innerHTML = compareAssets.map((a, i) =>
+    '<span class="cmp-tag"><span class="sw" style="background:' + CMP_COLORS[i] + '"></span>' + esc(a) +
+    ' <button type="button" data-a="' + esc(a) + '" title="Remove">×</button></span>').join('');
+  $('cmpTags').querySelectorAll('button').forEach(b => {
+    b.addEventListener('click', () => {
+      compareAssets = compareAssets.filter(x => x !== b.dataset.a);
+      delete compareRows[b.dataset.a];
+      renderCmpTags(); drawCompare();
+    });
+  });
+}
+async function addCompare(asset){
+  asset = (asset || '').trim();
+  if (!asset || compareAssets.includes(asset)) return;
+  if (compareAssets.length >= 3){ $('cmpHint').textContent = 'Compare holds max 3 assets — remove one first.'; return; }
+  $('cmpHint').textContent = '';
+  try {
+    const r = await fetch('/api/candles?asset=' + encodeURIComponent(asset) + '&date=' + encodeURIComponent(cur.date));
+    const j = await r.json();
+    compareAssets.push(asset);
+    compareRows[asset] = j.candles || [];
+    renderCmpTags(); drawCompare();
+  } catch (e){ $('cmpHint').textContent = 'Could not load ' + asset; }
+}
+function drawCompare(){
+  const cv = $('cmp');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const legend = $('cmpLegend');
+  if (compareAssets.length < 2){
+    ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
+    ctx.fillText('Pick at least 2 assets above to compare them.', 16, H / 2);
+    legend.innerHTML = '';
+    return;
+  }
+  const series = compareAssets.map(a => {
+    const rows = compareRows[a] || [];
+    if (!rows.length) return null;
+    const base = rows[0].close;
+    return {asset: a, pts: rows.map(r => ({m: toMin(r.time), v: r.close / base * 100}))};
+  }).filter(Boolean);
+  if (series.length < 2){
+    ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
+    ctx.fillText('Not enough data to compare yet.', 16, H / 2);
+    legend.innerHTML = '';
+    return;
+  }
+  let mn = Infinity, mx = -Infinity;
+  series.forEach(s => s.pts.forEach(p => { if (p.v < mn) mn = p.v; if (p.v > mx) mx = p.v; }));
+  const pad = (mx - mn) * 0.1 || 1; mn -= pad; mx += pad;
+  const X = m => 10 + m / 1439 * (W - 20);
+  const Y = v => 12 + (1 - (v - mn) / (mx - mn)) * (H - 32);
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(10, Y(100)); ctx.lineTo(W - 10, Y(100)); ctx.stroke();
+  ctx.fillStyle = '#9a9ca8'; ctx.font = '11px system-ui';
+  ctx.fillText('100', 12, Y(100) - 4);
+  series.forEach((s, i) => {
+    ctx.strokeStyle = CMP_COLORS[i]; ctx.lineWidth = 2; ctx.beginPath();
+    s.pts.forEach((p, k) => { if (k === 0) ctx.moveTo(X(p.m), Y(p.v)); else ctx.lineTo(X(p.m), Y(p.v)); });
+    ctx.stroke();
+  });
+  legend.innerHTML = series.map((s, i) => {
+    const chg = s.pts[s.pts.length - 1].v - 100;
+    return '<span><span class="sw" style="background:' + CMP_COLORS[i] + '"></span><b>' + esc(s.asset) +
+      '</b> ' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</span>';
+  }).join('');
+}
+$('cmpAdd').addEventListener('click', () => addCompare($('cmpSelect').value));
+$('cmpSelect').addEventListener('change', () => addCompare($('cmpSelect').value));
+
+// --- downloads: JSON + CSV (from loaded candles), PNG (chart canvas) ---
+function downloadBlob(name, blob){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+function baseName(){ return cur.asset + '_' + cur.date; }
+$('dlJson').addEventListener('click', () => {
+  const data = {asset: cur.asset, date: cur.date, count: cur.rows.length, candles: cur.rows};
+  downloadBlob(baseName() + '.json', new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'}));
+});
+$('dlCsv').addEventListener('click', () => {
+  const lines = ['time,open,high,low,close'];
+  cur.rows.forEach(r => lines.push([r.time, r.open, r.high, r.low, r.close].join(',')));
+  downloadBlob(baseName() + '.csv', new Blob([lines.join('\\n')], {type: 'text/csv'}));
+});
+$('dlPng').addEventListener('click', () => {
+  $('ch').toBlob(b => { if (b) downloadBlob(baseName() + '_chart.png', b); }, 'image/png');
+});
+
+// --- signal generator (viewer port of the bot's futures signals) ---
+$('sigForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const asset = $('sigAsset').value.trim() || cur.asset;
+  const date = $('sigDate').value || cur.date;
+  const days = Math.max(1, Math.min(10, parseInt($('sigDays').value, 10) || 5));
+  const pct = Math.max(0, Math.min(100, parseInt($('sigPct').value, 10) || 70));
+  $('sigResults').innerHTML = 'Loading…';
+  try {
+    const r = await fetch('/api/signals?asset=' + encodeURIComponent(asset) +
+      '&date=' + encodeURIComponent(date) + '&days=' + days + '&pct=' + pct);
+    const j = await r.json();
+    if (!j.signals || !j.signals.length){
+      $('sigResults').innerHTML = 'No signals — try a lower win% or more days. (Used ' + j.days +
+        ' day(s): ' + (j.dates || []).join(', ') + '.)';
+      return;
+    }
+    $('sigResults').innerHTML = '<b>' + j.count + ' signals</b> — from ' + j.days + ' day(s) (' +
+      (j.dates || []).join(', ') + '), win% ≥ ' + j.threshold_pct + '%:<br>' +
+      j.signals.map(s => esc(s.line) + ' — <span class="win">' + s.win_pct + '%</span> (' +
+        s.calls + 'C/' + s.puts + 'P)</span>').join('<br>');
+  } catch (err){
+    $('sigResults').innerHTML = 'Could not generate signals — check connection and retry.';
+  }
+});
+
 const search = $('assetSearch'), list = $('assetList');
 function showMatches(q){
   q = (q || '').trim().toUpperCase();
   const m = ASSETS.filter(a => !q || a.toUpperCase().includes(q));
   if (!m.length){ list.innerHTML = '<div class="match empty">No asset matches.</div>'; list.style.display = 'block'; return; }
-  list.innerHTML = m.map(a => '<div class="match" data-a="' + a + '">' + a + '</div>').join('') +
+  list.innerHTML = m.map(a => '<div class="match" data-a="' + a + '">' + a + payLabel(a) + '</div>').join('') +
     '<div class="match-count">' + m.length + ' assets — scroll or type to filter</div>';
   list.style.display = 'block';
 }
@@ -624,9 +1573,29 @@ setInterval(() => {
   $('autoText').textContent = 'Next refresh in ' + countdown + 's';
   if (countdown <= 0){ countdown = 30; refreshIfToday(); }
 }, 1000);
+setInterval(() => {
+  // live-candle countdown + tick staleness, every second
+  const now = dhakaNow();
+  if (liveTick && liveTick.price != null && cur.date === now.date){
+    $('liveCountdown').textContent = isTickStale()
+      ? 'Live tick stale — last tick ' + Math.max(0, Math.round(Date.now() / 1000 - liveTick.ts)) + 's ago'
+      : 'Live candle closes in ' + (59 - now.second) + 's';
+    if (isTickStale()) updateBadge();
+  } else {
+    $('liveCountdown').textContent = '';
+  }
+}, 1000);
 renderAll();
 setUpdated();
 $('clock').textContent = dhakaNow().time + ' Dhaka';
+$('sigAsset').value = cur.asset; $('sigDate').value = cur.date;
+$('cmpSelect').innerHTML = ASSETS.map(a => '<option value="' + a + '">' + a + '</option>').join('');
+loadPayouts();
+loadBestTimes();
+loadBotStatus();
+pollLiveTick();
+setInterval(pollLiveTick, 1000);
+setInterval(loadBotStatus, 60000);
 """
 
 
@@ -678,10 +1647,15 @@ def page_html(asset, date_str, assets, rows, error=""):
   <div>
     <div id="assetTitle" class="asset-name">{html.escape(asset or '')}</div>
     <div id="dateTitle" class="asset-date">{html.escape(date_str)} (Dhaka time)</div>
+    <div id="payoutLine" class="payout-line"></div>
   </div>
   <div class="asset-head-right">
+    <div class="head-price">
+      <div class="head-label">LIVE PRICE</div>
+      <div id="lastPrice" class="last-price">—</div>
+      <div id="chgLine" class="chg-line"></div>
+    </div>
     <span id="liveBadge" class="badge hist">—</span>
-    <span id="lastPrice" class="last-price">—</span>
   </div>
 </div>
 <div class="stats">
@@ -696,6 +1670,11 @@ def page_html(asset, date_str, assets, rows, error=""):
   <span id="updatedAt">Updated —</span>
   <span class="auto-progress"><span id="autoBar"></span></span>
   <span id="autoText">Next refresh in 30s</span>
+  <span id="liveCountdown"></span>
+</div>
+<div class="card">
+  <p class="panel-title">BOT STATUS</p>
+  <div id="botStatus" class="bot-status">Loading bot status…</div>
 </div>
 <div class="card chart-card">
   <div class="chart-toolbar"><span class="title">CANDLE CHART</span>
@@ -707,10 +1686,48 @@ def page_html(asset, date_str, assets, rows, error=""):
     <button type="button" id="zoomOut" class="tf-btn zoom-btn">−</button>
     <button type="button" id="zoomIn" class="tf-btn zoom-btn">+</button>
     <button type="button" id="zoomReset" class="tf-btn">Full day</button>
+    <button type="button" id="dlPng" class="tf-btn" title="Download the chart as a PNG image">⬇ PNG</button>
   </div>
   <canvas id="ch" width="940" height="240"></canvas>
+  <p class="marker-note">EMA 9 <span style="color:#06b6d4">—</span> &nbsp;EMA 21 <span style="color:#a78bfa">—</span>
+    &nbsp; <b>▲ CALL ≥70%</b> &nbsp; <i>▼ PUT ≥70%</i> — best-time markers from the past 5 days.
+    Red bands = missing candles. Dashed candle = live forming candle.</p>
+  <p class="panel-title" style="margin:12px 4px 6px">RSI 14 <span style="color:var(--muted);font-weight:400;letter-spacing:0">(chart timeframe)</span></p>
+  <canvas id="rsi" width="940" height="96"></canvas>
+</div>
+<div class="card">
+  <p class="panel-title">BEST TIME SLOTS — TOP WIN-RATE HH:MM (PAST 5 DAYS)</p>
+  <div id="bestMeta" style="color:var(--muted);font-size:12px;margin-bottom:8px"></div>
+  <div id="bestList" class="best-list"></div>
+</div>
+<div class="card">
+  <p class="panel-title">COMPARE ASSETS — NORMALIZED % CHANGE (INDEXED TO 100)</p>
+  <div class="cmp-picker">
+    <select id="cmpSelect"></select>
+    <button type="button" id="cmpAdd" class="btn ghost">+ Add asset</button>
+    <span id="cmpTags"></span>
+    <span id="cmpHint" style="color:var(--muted);font-size:12px"></span>
+  </div>
+  <canvas id="cmp" width="940" height="220"></canvas>
+  <div id="cmpLegend" class="legend"></div>
+</div>
+<div class="card">
+  <p class="panel-title">SIGNAL GENERATOR — MAJORITY-VOTE SIGNALS FROM PAST DAYS</p>
+  <form id="sigForm" class="sig-form">
+    <label>Asset <input id="sigAsset" type="text" value="{html.escape(asset or '')}"></label>
+    <label>Date <input id="sigDate" type="date" value="{html.escape(date_str)}"></label>
+    <label>Days <input id="sigDays" type="number" min="1" max="10" value="5"></label>
+    <label>Win% ≥ <input id="sigPct" type="number" min="0" max="100" value="70"></label>
+    <button type="submit" class="btn">Generate</button>
+  </form>
+  <div id="sigResults" class="sig-list"></div>
 </div>
 <div class="card table-card">
+  <div class="dl-row" style="padding-top:10px">
+    <span class="panel-title" style="margin:0">1-MIN CANDLES</span>
+    <button type="button" id="dlJson" class="btn ghost">⬇ JSON</button>
+    <button type="button" id="dlCsv" class="btn ghost">⬇ CSV</button>
+  </div>
   <table><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Dir</th></tr></thead>
   <tbody id="tbody">{trs}</tbody></table>
   <p id="rowCount" class="row-count">{len(rows)} candles</p>
@@ -722,27 +1739,102 @@ def page_html(asset, date_str, assets, rows, error=""):
 </body></html>"""
 
 
+def _viewer_password():
+    """The optional password from the environment — never hardcoded,
+    never stored anywhere else. Empty/unset = open viewer."""
+    return os.environ.get("VIEWER_PASSWORD", "").strip()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # keep the console quiet
         pass
 
-    def _send(self, body, ctype="text/html; charset=utf-8", code=200):
+    def _send(self, body, ctype="text/html; charset=utf-8", code=200, extra=None):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
 
+    def _send_json(self, obj, code=200):
+        self._send(json.dumps(obj), "application/json", code)
+
+    def _authorized(self):
+        """True when no VIEWER_PASSWORD is set, or the request carries
+        HTTP Basic Auth with the env password (any username)."""
+        pw = _viewer_password()
+        if not pw:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8", "replace")
+        except Exception:
+            return False
+        if ":" not in decoded:
+            return False
+        _, given = decoded.split(":", 1)
+        return hmac.compare_digest(given, pw)
+
     def do_GET(self):
-        q = parse_qs(urlparse(self.path).query)
-        path = urlparse(self.path).path
+        # Password gate: EVERY request (pages + API) when set.
+        if not self._authorized():
+            return self._send(
+                "<h2>Password required</h2>"
+                "<p>This candle viewer is password protected.</p>",
+                code=401,
+                extra={"WWW-Authenticate": 'Basic realm="Candle Viewer"'},
+            )
+        parsed = urlparse(self.path)
+        path = parsed.path
+        q = parse_qs(parsed.query)
+
+        def _int(name, default, lo, hi):
+            try:
+                return max(lo, min(hi, int((q.get(name) or [""])[0] or default)))
+            except (TypeError, ValueError):
+                return default
+
+        # API endpoints that need no asset list first.
+        if path == "/api/live_tick":
+            asset = normalize_asset((q.get("asset") or [""])[0] or "")
+            return self._send_json(STORE.live_tick(asset))
+        if path == "/api/payouts":
+            return self._send_json({"payouts": STORE.payouts()})
+        if path == "/api/bot_status":
+            return self._send_json(STORE.bot_status())
+        if path == "/api/best_times":
+            asset = normalize_asset((q.get("asset") or [""])[0] or "")
+            days = _int("days", 5, 1, 10)
+            ref = (q.get("date") or [""])[0] or today_dhaka_str()
+            try:
+                datetime.strptime(ref, "%Y-%m-%d")
+            except ValueError:
+                ref = today_dhaka_str()
+            return self._send_json(STORE.best_times(asset, days, ref))
+        if path == "/api/signals":
+            asset = normalize_asset((q.get("asset") or [""])[0] or "")
+            date_str = (q.get("date") or [""])[0] or today_dhaka_str()
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                date_str = today_dhaka_str()
+            days = _int("days", 5, 1, 10)
+            pct = _int("pct", 70, 0, 100)
+            gap = (q.get("gap") or ["1"])[0].lower() not in ("0", "false", "no")
+            return self._send_json(
+                STORE.signals(asset, date_str, days, pct, apply_gap=gap))
+
         try:
             assets = STORE.assets()
         except Exception as e:  # DB went away mid-run
             return self._send(f"<h2>Database error</h2><p>{html.escape(str(e))}</p>", code=500)
         if path == "/api/assets":
-            return self._send(json.dumps({"assets": assets}), "application/json")
+            return self._send_json({"assets": assets})
         date_str = (q.get("date") or [""])[0] or today_dhaka_str()
         asset = normalize_asset((q.get("asset") or [""])[0] or (assets[0] if assets else ""))
         try:
@@ -751,9 +1843,8 @@ class Handler(BaseHTTPRequestHandler):
             date_str = today_dhaka_str()
         if path == "/api/candles":
             _, rows = STORE.candles(asset, date_str)
-            return self._send(json.dumps(
-                {"asset": asset, "date": date_str, "count": len(rows), "candles": rows}),
-                "application/json")
+            return self._send_json(
+                {"asset": asset, "date": date_str, "count": len(rows), "candles": rows})
         if path != "/":
             return self._send("<h2>Not found</h2>", code=404)
         if not assets:
@@ -776,6 +1867,10 @@ def main():
     else:
         STORE = Store(connect_real())
         print(f"Connected. Assets in DB: {len(STORE.assets())}")
+    if _viewer_password():
+        print("Password protection is ON (VIEWER_PASSWORD is set).")
+    else:
+        print("Password protection is OFF (VIEWER_PASSWORD is not set).")
     # Render sets PORT and expects 0.0.0.0; on your PC it stays local.
     port = int(os.environ.get("PORT", args.port))
     host = os.environ.get("HOST", "0.0.0.0" if "PORT" in os.environ else "127.0.0.1")

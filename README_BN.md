@@ -24,15 +24,14 @@
 - পেজ খুলে search box-এ asset-এর নাম লিখো (যেমন EURUSD) — নিচে list আসবে, বেছে নাও; অথবা Quick chip-এ চাপ দাও। date দাও → পুরো দিনের candle টেবিল + চার্ট আসবে (ঢাকা সময়)
 - **Auto-refresh:** আজকের date হলে প্রতি ৩০ সেকেন্ডে নিজে নিজে নতুন candle আনবে — reload করতে হবে না। বন্ধ করতে চাইলে Auto-refresh টিক চিহ্ন তুলে দাও
 - **LIVE badge:** last candle ২ মিনিটের মধ্যে হলে সবুজ LIVE দেখাবে, পুরনো হলে STALE/DELAYED দেখাবে (কত মিনিট আগের সেটাও লেখা থাকবে)
-- **CANDLE CHART:** লাইন চার্টের বদলে এখন আসল candlestick চার্ট — সবুজ/লাল candle, wick সহ। উপরে 1m / 5m / 15m / 1h বাটন আছে — পুরো দিন দেখতে 15m বা 1h ভালো, 1m-এ প্রতিটা মিনিটের candle দেখাবে (নিচের টেবিল সবসময় 1-min candle-ই দেখায়)
+- **CANDLE CHART:** লাইন চার্টের বদলে এখন আসল candlestick চার্ট — সবুজ/লাল candle, wick সহ। উপরে 1m / 5m / 15m / 1h বাটন আছে — পুরো দিন দেখতে 15m বা 1h ভালো, 1m-এ প্রতিটা মিনিটের candle দেখাবে (নিচের টেবিল সবসময় 1-min candle-ই দেখায়)। **Timeframe মনে থাকে:** 1m বেছে নিলে refresh বা পেজ reload করলেও 1m-ই থাকবে, 15m-এ ফিরে যাবে না
 - **ZOOM:** চার্টের উপরে mouse wheel ঘোরালে zoom in/out হবে (cursor যেখানে সেখানেই zoom হবে), চার্ট ধরে টানলে (drag) ডানে-বামে সরানো যাবে। ফোনে **+ / −** বাটন চাপলে zoom হবে, **Full day** চাপলে আবার পুরো দিন দেখাবে। নতুন candle আসলে zoom আর reset হয় না — live edge-এ থাকলে view নিজে নিজে ডানে সরে যাবে যাতে latest candle দেখা যায়, আর পুরনো candle দেখতে থাকলে view যেখানে ছিল সেখানেই থাকবে
 - **Header:** উপরে asset-এর নাম বড় করে, live price বড় করে, আর দিনের open থেকে কত % বদলেছে (সবুজ/লাল) দেখাবে। পাশে ওই asset-এর payout % ও দেখাবে
-- **EMA + RSI:** চার্টের উপরে EMA 9 (সায়ান) আর EMA 21 (বেগুনি) লাইন, আর চার্টের নিচে RSI 14 প্যানেল (70/30 লাইন সহ) — বটের `signal_engine.py`-র `ema`/`rsi` ফর্মুলা হুবহু একই
-- **Best-time marker:** গত ৫ দিনের ডেটা থেকে যে HH:MM সময়ে win% ৭০% বা তার বেশি, সেগুলো চার্টে ▲ CALL / ▼ PUT চিহ্ন দিয়ে দেখাবে। নিচে **BEST TIME SLOTS** প্যানেলে সেরা ১০টা সময়ের list আছে (win%, CALL/PUT ভোট সহ)
+- **Clean chart:** চার্টে শুধু candle — কোনো EMA/RSI লাইন বা marker নেই, যাতে Quotex-এর মতো পরিষ্কার দেখায়
 - **Gap লাল চিহ্ন:** যেখানে candle missing, চার্টে লাল band আর টেবিলে লাল GAP row দেখাবে
 - **COMPARE:** সর্বোচ্চ ৩টা asset বেছে একসাথে compare করো — normalized % change লাইন (১০০ থেকে শুরু), legend-এ প্রতিটার % change লেখা থাকবে
 - **Download:** টেবিলের উপরে ⬇ JSON / ⬇ CSV বাটন — বর্তমান asset+date-র ডেটা ডাউনলোড হবে। চার্টের ⬇ PNG বাটন — চার্টের ছবি (PNG) ডাউনলোড হবে
-- **LIVE candle (Fix 11):** বট live tick পাঠালে প্রতি সেকেন্ডে আপডেট হওয়া forming candle চার্টে দেখাবে (dashed outline + LIVE লেখা), সাথে candle close হতে কত সেকেন্ড বাকি তার countdown, আর ১০ সেকেন্ড tick না আসলে STALE badge। বট এখনো tick না পাঠালে ভিউয়ার আগের মতোই চলবে — live candle শুধু লুকানো থাকবে
+- **LIVE candle (Fix 11):** বট live tick পাঠালে প্রতি সেকেন্ডে আপডেট হওয়া forming candle চার্টে দেখাবে (dashed outline + LIVE লেখা), সাথে চার্টের উপরে বড় করে countdown — candle close হতে কত সেকেন্ড বাকি, আর ১০ সেকেন্ড tick না আসলে STALE লেখা। বট এখনো tick না পাঠালে ভিউয়ার আগের মতোই চলবে — live candle শুধু লুকানো থাকবে
 - **Payout:** search list, quick chip আর header-এ প্রতিটা asset-এর payout % দেখাবে (বটের `payouts` টেবিল থেকে)
 - **BOT STATUS:** পেজের উপরে বটের status bar — last/next collection, live stream state, Stopped/Resumed asset, Quotex session, free/premium ON/OFF
 - **SIGNAL GENERATOR:** asset + date + days + win% দিয়ে ভিউয়ার থেকেই signal list বানাও — বটের majority-vote লজিক (৫ দিনের HH:MM ভোট, strength filter, ৭ মিনিট gap)
@@ -52,6 +51,7 @@
 
 ## মনে রাখো
 
+- সার্ভার এখন threaded — একসাথে অনেক request আসলেও পেজ আটকে যাবে না; ডেটাবেজ কানেকশন ছিঁড়ে গেলে নিজে reconnect করে নেবে, আর API সবসময় JSON উত্তর দেবে (আগে মাঝে মাঝে 502 / "Could not load candles" আসতো)
 - Free plan-এ ১৫ মিনিট কেউ না খুললে সার্ভিস ঘুমিয়ে যায় — লিংক খুললেই আবার জেগে উঠবে, ২০-৩০ সেকেন্ড লাগতে পারে
 - এই লিংক যার কাছে থাকবে, সে-ই candle ডেটা দেখতে পারবে — এতে শুধু বাজারের ডেটা আছে, কোনো পাসওয়ার্ড নেই
 - PC-তে লোকালভাবে চালাতে চাইলে: `export DATABASE_URL="postgres://..."` দিয়ে `python view_candles.py` চালাও, তারপর http://127.0.0.1:8001/ খোলো

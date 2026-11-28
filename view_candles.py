@@ -32,14 +32,17 @@ for HTTP Basic Auth (any username, that password). When it is unset,
 the viewer stays open exactly as before.
 
 UI: dark-ash premium theme, asset search, auto-refresh every 30s
-for today, live/stale badge, gap detector, EMA 9/21 + RSI 14,
-best-time markers, compare mode, downloads, live forming candle,
-payouts, best time slots, signal generator and a bot status bar.
+for today, live/stale badge, gap detector, clean chart (candles only,
+no indicators), compare mode, downloads, live forming candle with a
+countdown in the chart header, payouts, signal generator and a bot
+status bar. Threaded server + DB reconnect so one slow request can
+never stall the page or Render's health check.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hmac
 import html
 import json
@@ -47,9 +50,10 @@ import math
 import os
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -61,6 +65,57 @@ UTC = timezone.utc
 
 DEFAULT_PORT = 8001
 LIVE_STALE_SECONDS = 10  # no tick for this long = STALE (same as the bot's live badge rule)
+
+# --- concurrency + DB health (fix, 2026-11-28): the viewer used to run
+# on a single-threaded HTTPServer, so one slow request (best_times /
+# signals) blocked every other request — including Render's health
+# check, which then marked the service failed and the in-flight
+# requests got 502s. Now it threads, and all Store DB access is
+# serialized through one re-entrant lock (psycopg2 connections are
+# not safe for concurrent use). A dead connection is re-established
+# once and the query retried, instead of failing.
+try:
+    import psycopg2 as _psycopg2
+    _CONN_ERRORS = (_psycopg2.InterfaceError, _psycopg2.OperationalError)
+except Exception:  # pragma: no cover - demo without psycopg2
+    _psycopg2 = None
+    _CONN_ERRORS = ()
+
+STORE_LOCK = threading.RLock()
+
+
+def _is_conn_error(exc):
+    """True for a dead/broken DB connection (InterfaceError /
+    OperationalError) — the only errors worth reconnecting for. A
+    missing table or bad SQL is a real error, not a dead connection."""
+    return bool(_CONN_ERRORS) and isinstance(exc, _CONN_ERRORS)
+
+
+def _db_retry(fn):
+    """Retry a Store method once after reconnecting, but only when
+    the failure is a dead connection. Other errors pass through."""
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        try:
+            return fn(self, *a, **kw)
+        except Exception as e:
+            if not _is_conn_error(e) or self.demo:
+                raise
+            self._rollback()
+            self._reconnect()
+            return fn(self, *a, **kw)
+    return wrapper
+
+
+def _locked(fn):
+    """Serialize Store DB access through one re-entrant lock (RLock:
+    best_times/signals call self.candles internally, so the same
+    thread must be able to re-enter)."""
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with STORE_LOCK:
+            return fn(self, *a, **kw)
+    return wrapper
 
 # --- signal-engine constants, mirrored from bot/signal_engine.py ---
 MIN_BODY = 0.00025
@@ -336,11 +391,25 @@ class Store:
         except Exception:
             pass
 
+    def _reconnect(self):
+        """Drop the dead connection and open a fresh one (real mode
+        only — demo mode has an in-memory DB that cannot be rebuilt).
+        Called only from _db_retry, while STORE_LOCK is held."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = connect_real()
+
+    @_locked
+    @_db_retry
     def assets(self):
         cur = self.conn.cursor()
         cur.execute("SELECT DISTINCT asset FROM candles ORDER BY asset")
         return [r[0] for r in cur.fetchall()]
 
+    @_locked
+    @_db_retry
     def candles(self, asset, date_str):
         asset = normalize_asset(asset)
         start, end = dhaka_date_range_utc(date_str)
@@ -362,6 +431,8 @@ class Store:
             })
         return asset, rows
 
+    @_locked
+    @_db_retry
     def dates(self, asset=None):
         """Dhaka dates that have candles (for one asset, or all)."""
         try:
@@ -376,10 +447,15 @@ class Store:
             for (ts,) in cur.fetchall():
                 out.add(_parse_ts(ts).astimezone(DHAKA).strftime("%Y-%m-%d"))
             return sorted(out)
-        except Exception:
+        except Exception as e:
+            if _is_conn_error(e):
+                self._rollback()
+                raise
             self._rollback()
             return []
 
+    @_locked
+    @_db_retry
     def get_state(self, key, default=None):
         """One collector_state value (bot's DB state keys). None when
         the table/key does not exist yet — never raises."""
@@ -390,10 +466,15 @@ class Store:
                 (key,))
             row = cur.fetchone()
             return row[0] if row else default
-        except Exception:
+        except Exception as e:
+            if _is_conn_error(e):
+                self._rollback()
+                raise
             self._rollback()
             return default
 
+    @_locked
+    @_db_retry
     def payouts(self):
         """Bot's stored payouts (candles_db.get_payouts): the payouts
         table, best payout first. [] when the collector never stored
@@ -409,7 +490,10 @@ class Store:
             rows.sort(key=lambda r: (-(r["payout"] if r["payout"] is not None else -1),
                                      r["asset"]))
             return rows
-        except Exception:
+        except Exception as e:
+            if _is_conn_error(e):
+                self._rollback()
+                raise
             self._rollback()
             return []
 
@@ -432,6 +516,8 @@ class Store:
                 "open": base, "high": max(base, price),
                 "low": min(base, price), "close": price, "demo": True}
 
+    @_locked
+    @_db_retry
     def live_tick(self, asset):
         """The bot's live tick for one asset, from the collector_state
         key 'live_ticks' (published by the bot's live stream).
@@ -478,6 +564,8 @@ class Store:
                 "low": _fnum(entry.get("low")),
                 "close": _fnum(entry.get("close"))}
 
+    @_locked
+    @_db_retry
     def bot_status(self):
         """Bot Status from the bot's DB state keys — the same keys
         handlers._run_bot_status reads via collector.get_status_summary
@@ -509,7 +597,10 @@ class Store:
                 (start.strftime(fmt),
                  datetime.now(UTC).strftime(fmt)))
             today_count = cur.fetchone()[0]
-        except Exception:
+        except Exception as e:
+            if _is_conn_error(e):
+                self._rollback()
+                raise
             self._rollback()
         return {
             "last_collection": _utc_iso_to_dhaka(self.get_state("last_collection")),
@@ -527,7 +618,6 @@ class Store:
             "total_candles": total,
             "today_date": today,
             "today_count": today_count,
-            "dates": self.dates(),
             "now_dhaka": datetime.now(DHAKA).strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -556,6 +646,8 @@ class Store:
                 slot["rep"] = r  # representative = latest day's candle
         return by_minute
 
+    @_locked
+    @_db_retry
     def best_times(self, asset, days=5, ref_date=None):
         """Per-HH:MM majority-vote win rate over the past `days`
         completed days (same logic as the bot's signal engine:
@@ -581,6 +673,8 @@ class Store:
         return {"asset": asset, "ref_date": ref_date, "days": len(use),
                 "dates": use, "count": len(slots), "slots": slots}
 
+    @_locked
+    @_db_retry
     def signals(self, asset, date_str, days=5, min_win_pct=70, apply_gap=True):
         """Futures signals for `date_str`, built from the `days`
         completed days before it — a simplified port of the bot's
@@ -737,12 +831,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-appl
   padding:5px 13px;font-size:13px;cursor:pointer;font-weight:700}
 .tf-btn:hover{border-color:var(--cyan)}
 .tf-btn.active{background:linear-gradient(135deg,var(--violet),var(--cyan));border-color:transparent;color:#fff}
+.live-countdown{margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:13px;font-weight:700;color:#67e8f9;white-space:nowrap}
+.live-countdown.stale{color:#fb7185}
+.live-countdown:empty{display:none}
 .zoom-btn{font-size:15px;padding:5px 12px}
 canvas{width:100%;height:240px;display:block;cursor:grab;touch-action:none}
-#rsi{height:96px;cursor:default}
 .marker-note{color:var(--muted);font-size:12px;margin:6px 4px 0}
-.marker-note b{color:#4ade80}
-.marker-note i{color:#fb7185;font-style:normal}
 .legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin:8px 4px 0}
 .legend span b{font-family:ui-monospace,Menlo,monospace}
 .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
@@ -762,13 +856,6 @@ tr.gap-row td{background:rgba(244,63,94,.16);color:#fb7185;text-align:center !im
 .row-count{color:var(--muted);font-size:12px;margin:10px 14px 0}
 .dl-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:0 14px 10px}
 .panel-title{font-weight:700;font-size:13px;letter-spacing:1px;color:var(--muted);margin:0 0 10px}
-.best-list{display:flex;flex-direction:column;gap:6px}
-.best-row{display:flex;align-items:center;gap:10px;font-family:ui-monospace,Menlo,monospace;font-size:14px}
-.best-row .t{width:56px;font-weight:700}
-.best-row .bar{flex:1;height:8px;border-radius:99px;background:#33333c;overflow:hidden}
-.best-row .bar span{display:block;height:100%;background:linear-gradient(90deg,var(--violet),var(--cyan))}
-.best-row .w{width:96px;text-align:right}
-.best-row .v{width:64px;text-align:right;color:var(--muted);font-size:12px}
 .sig-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 .sig-form input,.sig-form select{width:auto;min-width:110px;padding:9px 10px;font-size:14px}
 .sig-form label{color:var(--muted);font-size:12px}
@@ -848,39 +935,21 @@ function statusOf(rows){
   return {cls: 'stale', label: 'STALE ' + diff + 'm'};
 }
 
-// --- EMA / RSI: exact ports of bot/signal_engine.py ema() and rsi() ---
-// ema: k = 2/(period+1), seeded with values[0], full-length series.
-// rsi: trailing value over the last `period` diffs; 50.0 when fewer
-// than period+1 closes, 100.0 when avg loss is 0.
-function emaSeries(values, period){
-  const out = [];
-  if (!values.length) return out;
-  const k = 2 / (period + 1);
-  let e = values[0];
-  for (const v of values){ e = v * k + e * (1 - k); out.push(e); }
-  return out;
+// Chart timeframe in minutes (1 / 5 / 15 / 60). It survives reloads:
+// the URL carries ?tf= and the last choice is kept in localStorage,
+// so a refresh (or a full page reload) never silently drops back to 15m.
+function initialTf(){
+  try {
+    const u = new URLSearchParams(location.search).get('tf');
+    if (u && [1, 5, 15, 60].indexOf(+u) !== -1) return +u;
+    const s = localStorage.getItem('viewer_tf');
+    if (s && [1, 5, 15, 60].indexOf(+s) !== -1) return +s;
+  } catch (e){}
+  return 15;
 }
-function rsiValue(closes, period){
-  if (closes.length < period + 1) return 50.0;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++){
-    const diff = closes[closes.length - i] - closes[closes.length - i - 1];
-    if (diff > 0) gains += diff; else losses += -diff;
-  }
-  const avgGain = gains / period, avgLoss = losses / period;
-  if (avgLoss === 0) return 100.0;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-function rsiSeries(closes, period){
-  const out = [];
-  for (let i = 0; i < closes.length; i++) out.push(rsiValue(closes.slice(0, i + 1), period));
-  return out;
-}
-
-let tf = 15;  // chart timeframe in minutes (1 / 5 / 15 / 60)
+let tf = initialTf();
+let loadToken = 0;      // guards the loadAsset retry (see below)
 let payouts = {};       // asset -> {payout, open, updated_at}
-let bestSlots = [];     // /api/best_times slots for the current asset
 let liveTick = null;    // last /api/live_tick result {price, ts, stale}
 let liveCandle = null;  // forming candle {minute HH:MM, open, high, low, close}
 
@@ -943,7 +1012,6 @@ function drawChart(){
   if (candles.length < 2){
     ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
     ctx.fillText('No data to chart', 16, H / 2);
-    drawRSI();
     return;
   }
   let mn = Infinity, mx = -Infinity;
@@ -1011,38 +1079,6 @@ function drawChart(){
       ctx.fillText('LIVE', Math.max(4, x - 12), Math.max(12, Y(c.high) - 6));
     }
   });
-  // EMA 9 (cyan) + EMA 21 (violet) over the full day's closes
-  const closesAll = all.map(c => c.close);
-  const e9 = emaSeries(closesAll, 9), e21 = emaSeries(closesAll, 21);
-  [['#06b6d4', e9], ['#a78bfa', e21]].forEach(pair => {
-    const col = pair[0], series = pair[1];
-    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
-    let started = false;
-    for (let i = a; i < b; i++){
-      const x = X(i - a), y = Y(series[i]);
-      if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  });
-  // best-time markers: win% >= 70% slots as CALL/PUT triangles
-  const bmap2 = {};
-  all.forEach((c, i) => { bmap2[c.bucket] = i; });
-  bestSlots.forEach(s => {
-    if (s.win_rate < 0.70) return;
-    const idx = bmap2[Math.floor(toMin(s.hhmm) / tf)];
-    if (idx === undefined || idx < a || idx >= b) return;
-    const c = all[idx], x = X(idx - a);
-    ctx.font = 'bold 10px system-ui';
-    if (s.direction === 'CALL'){
-      ctx.fillStyle = '#4ade80';
-      ctx.beginPath(); ctx.moveTo(x, Y(c.high) - 12); ctx.lineTo(x - 5, Y(c.high) - 4); ctx.lineTo(x + 5, Y(c.high) - 4); ctx.closePath(); ctx.fill();
-      ctx.fillText(s.win_pct + '%', x - 12, Math.max(10, Y(c.high) - 15));
-    } else {
-      ctx.fillStyle = '#fb7185';
-      ctx.beginPath(); ctx.moveTo(x, Y(c.low) + 12); ctx.lineTo(x - 5, Y(c.low) + 4); ctx.lineTo(x + 5, Y(c.low) + 4); ctx.closePath(); ctx.fill();
-      ctx.fillText(s.win_pct + '%', x - 12, Math.min(H - 24, Y(c.low) + 24));
-    }
-  });
   const last = candles[candles.length - 1];
   const lastCol = last.close > last.open ? '#22c55e' : (last.close < last.open ? '#f43f5e' : '#f59e0b');
   ctx.fillStyle = '#9a9ca8'; ctx.font = '12px system-ui';
@@ -1050,46 +1086,19 @@ function drawChart(){
   ctx.fillText(last.time, W - padR - 36, H - 6);
   ctx.fillStyle = lastCol; ctx.font = 'bold 13px system-ui';
   ctx.fillText(fmtPrice(last.close), Math.max(10, X(candles.length - 1) - 70), Math.max(16, Y(last.close) - 10));
-  drawRSI();
 }
 
-function drawRSI(){
-  const cv = $('rsi');
-  if (!cv) return;
-  const ctx = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
-  ctx.clearRect(0, 0, W, H);
-  const all = aggRows();
-  if (all.length < 2){
-    ctx.fillStyle = '#9a9ca8'; ctx.font = '13px system-ui';
-    ctx.fillText('RSI needs at least 2 candles', 16, H / 2);
-    return;
-  }
-  const vals = rsiSeries(all.map(c => c.close), 14);
-  const Y = v => 8 + (1 - v / 100) * (H - 16);
-  ctx.fillStyle = 'rgba(244,63,94,0.06)'; ctx.fillRect(0, 8, W, Y(70) - 8);
-  ctx.fillStyle = 'rgba(34,197,94,0.06)'; ctx.fillRect(0, Y(30), W, H - 8 - Y(30));
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
-  [70, 50, 30].forEach(v => { ctx.beginPath(); ctx.moveTo(0, Y(v)); ctx.lineTo(W, Y(v)); ctx.stroke(); });
-  ctx.fillStyle = '#9a9ca8'; ctx.font = '11px system-ui';
-  ctx.fillText('70', 6, Y(70) - 3); ctx.fillText('50', 6, Y(50) - 3); ctx.fillText('30', 6, Y(30) - 3);
-  ctx.strokeStyle = '#06b6d4'; ctx.lineWidth = 1.5; ctx.beginPath();
-  vals.forEach((v, i) => {
-    const x = 8 + i * (W - 16) / Math.max(1, vals.length - 1), y = Y(v);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-  const last = vals[vals.length - 1];
-  ctx.fillStyle = last >= 50 ? '#4ade80' : '#fb7185';
-  ctx.font = 'bold 13px system-ui';
-  ctx.fillText('RSI 14: ' + last.toFixed(1), W - 110, 18);
+function syncTfButtons(){
+  document.querySelectorAll('.tf-btn[data-tf]').forEach(x =>
+    x.classList.toggle('active', +x.dataset.tf === tf));
 }
-
 document.querySelectorAll('.tf-btn[data-tf]').forEach(b => {
   b.addEventListener('click', () => {
-    document.querySelectorAll('.tf-btn[data-tf]').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
     tf = parseInt(b.dataset.tf, 10) || 15;
+    try { localStorage.setItem('viewer_tf', String(tf)); } catch (e){}
+    history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) +
+      '&date=' + encodeURIComponent(cur.date) + '&tf=' + tf);
+    syncTfButtons();
     view = null;  // new timeframe = full day again
     drawChart();
   });
@@ -1213,6 +1222,7 @@ function updateHeaderPrice(){
 }
 
 function renderAll(){
+  syncTfButtons();
   const rows = cur.rows;
   $('statCount').textContent = rows.length;
   $('statFirst').textContent = rows.length ? rows[0].time : '—';
@@ -1249,13 +1259,31 @@ function renderAll(){
   drawChart();
 }
 
-async function loadAsset(asset, date, keepView){
+async function loadAsset(asset, date, keepView, _retried){
   asset = (asset || '').trim();
   if (!asset) return;
+  const myToken = ++loadToken;
   const url = '/api/candles?asset=' + encodeURIComponent(asset) + '&date=' + encodeURIComponent(date || cur.date);
+  let j = null;
   try {
     const r = await fetch(url);
-    const j = await r.json();
+    j = await r.json();
+    if (!r.ok || !j || j.error || !Array.isArray(j.candles)){
+      throw new Error((j && j.error) ? j.error : 'bad response');
+    }
+  } catch (e){
+    // A failed load (502 / DB blip) must not blank the page: keep the
+    // old chart and retry once after 2s before giving up. The token
+    // guard stops a stale retry from overwriting a newer asset.
+    if (!_retried){
+      $('errLine').textContent = 'Could not load candles — retrying…';
+      setTimeout(() => { if (myToken === loadToken) loadAsset(asset, date, keepView, true); }, 2000);
+    } else {
+      $('errLine').textContent = 'Could not load candles — check connection and retry.';
+    }
+    return;
+  }
+  {
     // Bug fix (the owner, 2026-11-27): the 30s auto-refresh calls
     // loadAsset for the SAME asset/date — it used to reset view to
     // null every time, so the chart zoomed out whenever a new candle
@@ -1270,17 +1298,14 @@ async function loadAsset(asset, date, keepView){
       view = null; liveCandle = null; liveTick = null;
     }
     document.title = 'Candles — ' + cur.asset + ' ' + cur.date;
-    history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date));
+    history.replaceState(null, '', '/?asset=' + encodeURIComponent(cur.asset) + '&date=' + encodeURIComponent(cur.date) + '&tf=' + tf);
     $('dateInput').value = cur.date;
     $('sigAsset').value = cur.asset; $('sigDate').value = cur.date;
     $('errLine').textContent = cur.rows.length ? '' : 'No candles for this asset on this date — try another date.';
     renderAll();
     setUpdated();
     countdown = 30;
-    loadBestTimes();
     pollLiveTick();
-  } catch (e){
-    $('errLine').textContent = 'Could not load candles — check connection and retry.';
   }
 }
 
@@ -1310,35 +1335,6 @@ function payLabel(a){
   const p = payouts[a];
   if (!p || p.payout == null) return '';
   return '<span class="pay' + (p.open === false ? ' closed' : '') + '">' + p.payout + '%</span>';
-}
-
-// --- best times: chart markers + best-slot panel ---
-async function loadBestTimes(){
-  try {
-    const r = await fetch('/api/best_times?asset=' + encodeURIComponent(cur.asset) +
-      '&days=5&date=' + encodeURIComponent(cur.date));
-    const j = await r.json();
-    bestSlots = j.slots || [];
-    renderBestPanel(j);
-    drawChart();
-  } catch (e){ /* markers are a bonus — the chart works without them */ }
-}
-function renderBestPanel(j){
-  const el = $('bestList');
-  const top = (j.slots || []).slice(0, 10);
-  $('bestMeta').textContent = 'Based on ' + j.days + ' day(s): ' + (j.dates || []).join(', ') +
-    ' — win% = majority votes for that HH:MM across those days';
-  if (!top.length){
-    el.innerHTML = '<div class="empty">No best-time slots yet — need past days of data for this asset.</div>';
-    return;
-  }
-  el.innerHTML = top.map(s =>
-    '<div class="best-row"><span class="t">' + s.hhmm + '</span>' +
-    '<span class="pill ' + s.direction.toLowerCase() + '">' + s.direction + '</span>' +
-    '<span class="bar"><span style="width:' + s.win_pct + '%"></span></span>' +
-    '<span class="w">' + s.win_pct + '%</span>' +
-    '<span class="v">' + s.calls + 'C / ' + s.puts + 'P</span></div>'
-  ).join('');
 }
 
 // --- bot status bar ---
@@ -1574,15 +1570,24 @@ setInterval(() => {
   if (countdown <= 0){ countdown = 30; refreshIfToday(); }
 }, 1000);
 setInterval(() => {
-  // live-candle countdown + tick staleness, every second
+  // Live-candle countdown, every second — always visible in the chart
+  // header while viewing today (Quotex-style), never blank.
+  const el = $('liveCountdown');
   const now = dhakaNow();
-  if (liveTick && liveTick.price != null && cur.date === now.date){
-    $('liveCountdown').textContent = isTickStale()
-      ? 'Live tick stale — last tick ' + Math.max(0, Math.round(Date.now() / 1000 - liveTick.ts)) + 's ago'
-      : 'Live candle closes in ' + (59 - now.second) + 's';
-    if (isTickStale()) updateBadge();
+  if (cur.date !== now.date){ el.textContent = ''; el.className = 'live-countdown'; return; }
+  if (liveTick && liveTick.price != null){
+    if (isTickStale()){
+      el.textContent = 'Live tick stale — last tick ' +
+        Math.max(0, Math.round(Date.now() / 1000 - liveTick.ts)) + 's ago';
+      el.className = 'live-countdown stale';
+      updateBadge();
+    } else {
+      el.textContent = '● LIVE — candle closes in ' + (59 - now.second) + 's';
+      el.className = 'live-countdown';
+    }
   } else {
-    $('liveCountdown').textContent = '';
+    el.textContent = 'Live candle — waiting for tick…';
+    el.className = 'live-countdown';
   }
 }, 1000);
 renderAll();
@@ -1591,7 +1596,6 @@ $('clock').textContent = dhakaNow().time + ' Dhaka';
 $('sigAsset').value = cur.asset; $('sigDate').value = cur.date;
 $('cmpSelect').innerHTML = ASSETS.map(a => '<option value="' + a + '">' + a + '</option>').join('');
 loadPayouts();
-loadBestTimes();
 loadBotStatus();
 pollLiveTick();
 setInterval(pollLiveTick, 1000);
@@ -1599,7 +1603,7 @@ setInterval(loadBotStatus, 60000);
 """
 
 
-def page_html(asset, date_str, assets, rows, error=""):
+def page_html(asset, date_str, assets, rows, error="", tf=15):
     trs = "".join(
         f"<tr><td>{r['time']}</td><td>{fmt_price(r['open'])}</td>"
         f"<td>{fmt_price(r['high'])}</td><td>{fmt_price(r['low'])}</td>"
@@ -1670,7 +1674,6 @@ def page_html(asset, date_str, assets, rows, error=""):
   <span id="updatedAt">Updated —</span>
   <span class="auto-progress"><span id="autoBar"></span></span>
   <span id="autoText">Next refresh in 30s</span>
-  <span id="liveCountdown"></span>
 </div>
 <div class="card">
   <p class="panel-title">BOT STATUS</p>
@@ -1678,27 +1681,19 @@ def page_html(asset, date_str, assets, rows, error=""):
 </div>
 <div class="card chart-card">
   <div class="chart-toolbar"><span class="title">CANDLE CHART</span>
-    <button type="button" class="tf-btn" data-tf="1">1m</button>
-    <button type="button" class="tf-btn" data-tf="5">5m</button>
-    <button type="button" class="tf-btn active" data-tf="15">15m</button>
-    <button type="button" class="tf-btn" data-tf="60">1h</button>
+    <button type="button" class="tf-btn{' active' if tf == 1 else ''}" data-tf="1">1m</button>
+    <button type="button" class="tf-btn{' active' if tf == 5 else ''}" data-tf="5">5m</button>
+    <button type="button" class="tf-btn{' active' if tf == 15 else ''}" data-tf="15">15m</button>
+    <button type="button" class="tf-btn{' active' if tf == 60 else ''}" data-tf="60">1h</button>
     <span class="title" style="margin-left:8px">ZOOM</span>
     <button type="button" id="zoomOut" class="tf-btn zoom-btn">−</button>
     <button type="button" id="zoomIn" class="tf-btn zoom-btn">+</button>
     <button type="button" id="zoomReset" class="tf-btn">Full day</button>
     <button type="button" id="dlPng" class="tf-btn" title="Download the chart as a PNG image">⬇ PNG</button>
+    <span id="liveCountdown" class="live-countdown"></span>
   </div>
   <canvas id="ch" width="940" height="240"></canvas>
-  <p class="marker-note">EMA 9 <span style="color:#06b6d4">—</span> &nbsp;EMA 21 <span style="color:#a78bfa">—</span>
-    &nbsp; <b>▲ CALL ≥70%</b> &nbsp; <i>▼ PUT ≥70%</i> — best-time markers from the past 5 days.
-    Red bands = missing candles. Dashed candle = live forming candle.</p>
-  <p class="panel-title" style="margin:12px 4px 6px">RSI 14 <span style="color:var(--muted);font-weight:400;letter-spacing:0">(chart timeframe)</span></p>
-  <canvas id="rsi" width="940" height="96"></canvas>
-</div>
-<div class="card">
-  <p class="panel-title">BEST TIME SLOTS — TOP WIN-RATE HH:MM (PAST 5 DAYS)</p>
-  <div id="bestMeta" style="color:var(--muted);font-size:12px;margin-bottom:8px"></div>
-  <div id="bestList" class="best-list"></div>
+  <p class="marker-note">Red bands = missing candles. Dashed candle = live forming candle.</p>
 </div>
 <div class="card">
   <p class="panel-title">COMPARE ASSETS — NORMALIZED % CHANGE (INDEXED TO 100)</p>
@@ -1757,7 +1752,10 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(b)
+        try:
+            self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away — the request is already answered
 
     def _send_json(self, obj, code=200):
         self._send(json.dumps(obj), "application/json", code)
@@ -1791,6 +1789,26 @@ class Handler(BaseHTTPRequestHandler):
             )
         parsed = urlparse(self.path)
         path = parsed.path
+        try:
+            self._dispatch(parsed, path)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away mid-response — nothing to send
+        except Exception as e:
+            # Never answer an API call with HTML: the JS does r.json()
+            # and an HTML error page breaks every loader. JSON always.
+            try:
+                if path.startswith("/api/"):
+                    self._send_json(
+                        {"error": "Database unavailable — retry in a few seconds."},
+                        code=500)
+                else:
+                    self._send(
+                        f"<h2>Database error</h2><p>{html.escape(str(e))}</p>",
+                        code=500)
+            except Exception:
+                pass
+
+    def _dispatch(self, parsed, path):
         q = parse_qs(parsed.query)
 
         def _int(name, default, lo, hi):
@@ -1829,10 +1847,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 STORE.signals(asset, date_str, days, pct, apply_gap=gap))
 
-        try:
-            assets = STORE.assets()
-        except Exception as e:  # DB went away mid-run
-            return self._send(f"<h2>Database error</h2><p>{html.escape(str(e))}</p>", code=500)
+        assets = STORE.assets()
         if path == "/api/assets":
             return self._send_json({"assets": assets})
         date_str = (q.get("date") or [""])[0] or today_dhaka_str()
@@ -1846,13 +1861,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 {"asset": asset, "date": date_str, "count": len(rows), "candles": rows})
         if path != "/":
+            if path.startswith("/api/"):
+                return self._send_json({"error": "unknown endpoint"}, code=404)
             return self._send("<h2>Not found</h2>", code=404)
+        tf = _int("tf", 15, 1, 60)
+        if tf not in (1, 5, 15, 60):
+            tf = 15
         if not assets:
-            return self._send(page_html("", date_str, [], [], "No candles in the DB yet."))
+            return self._send(page_html("", date_str, [], [], "No candles in the DB yet.", tf=tf))
         _, rows = STORE.candles(asset, date_str)
         err = "" if rows else "No candles for this asset on this date — try another date."
-        self._send(page_html(asset, date_str, assets, rows, err))
-
+        self._send(page_html(asset, date_str, assets, rows, err, tf=tf))
 
 def main():
     global STORE
@@ -1879,7 +1898,9 @@ def main():
         print("Press Ctrl+C to stop. (Only your PC can open it — it is not public.)")
     else:
         print(f"Listening on {host}:{port} — open the Render service URL.")
-    HTTPServer((host, port), Handler).serve_forever()
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
 
 
 if __name__ == "__main__":

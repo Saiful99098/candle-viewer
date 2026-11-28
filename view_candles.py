@@ -507,12 +507,12 @@ class Store:
         _, rows = self.candles(asset, dates[-1])
         if not rows:
             return {"asset": asset, "price": None, "ts": None, "stale": True}
-        now = datetime.now(DHAKA)
+        now = datetime.now(timezone.utc)
         base = rows[-1]["close"]
         price = base + math.sin(time.time() / 7.0) * 0.001 * base
         return {"asset": asset, "price": round(price, 5),
                 "ts": int(time.time()), "stale": False,
-                "minute": now.strftime("%Y-%m-%d %H:%M"),
+                "minute": now.strftime("%Y-%m-%d %H:%M"),  # UTC, like the real bot
                 "open": base, "high": max(base, price),
                 "low": min(base, price), "close": price, "demo": True}
 
@@ -1008,6 +1008,12 @@ function drawChart(){
   const total = all.length;
   let a = 0, b = total;
   if (view){ a = Math.max(0, Math.floor(view[0])); b = Math.min(total, Math.ceil(view[1])); }
+  // Live candle follow (the owner, 2026-11-28): when the view is
+  // pinned to the right edge (the latest data), the forming live
+  // candle appended each second must stay visible — otherwise a
+  // zoomed chart never shows it move. A view panned back to older
+  // candles is left exactly where it is.
+  if (view && total && all[total - 1].live && view[1] >= total - 1) b = total;
   const candles = all.slice(a, b);
   if (candles.length < 2){
     ctx.fillStyle = '#9a9ca8'; ctx.font = '14px system-ui';
@@ -1370,6 +1376,21 @@ async function pollLiveTick(){
     handleTick(await r.json());
   } catch (e){ /* keep the last tick state; the badge falls back to candle status */ }
 }
+// The bot publishes the forming candle's minute in UTC ("YYYY-MM-DD
+// HH:MM"); the chart's rows are Dhaka HH:MM. Convert it, so the live
+// candle lands on the current Dhaka minute — slicing the UTC HH:MM
+// straight out put it 6h behind, and displayRows() dropped it as
+// "behind the closed data", so the forming candle never appeared
+// (the owner, 2026-11-28: "running candle er live movement dekhai e na").
+function utcMinuteToDhaka(minuteStr){
+  const m = (minuteStr || '').match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  d.setUTCHours(d.getUTCHours() + 6);  // Dhaka is UTC+6, no DST
+  const p = n => String(n).padStart(2, '0');
+  return {date: d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()),
+          hhmm: p(d.getUTCHours()) + ':' + p(d.getUTCMinutes())};
+}
 function handleTick(j){
   if (!j || j.price == null || j.ts == null){
     liveTick = null; liveCandle = null; updateBadge(); return;
@@ -1379,8 +1400,10 @@ function handleTick(j){
   if (cur.date !== now.date){ liveCandle = null; updateBadge(); updateHeaderPrice(); return; }
   if (j.open != null && j.high != null && j.low != null && j.close != null){
     // Rich forming-candle form: the bot already tracked OHLC.
-    let minute = (j.minute || '').slice(11, 16) || now.hhmm;
-    if (j.minute && j.minute.slice(0, 10) !== cur.date) minute = now.hhmm;
+    // The bot's minute is UTC — convert it to Dhaka first.
+    let minute = now.hhmm;
+    const dh = utcMinuteToDhaka(j.minute);
+    if (dh && dh.date === cur.date) minute = dh.hhmm;
     liveCandle = {minute: minute, open: j.open, high: j.high, low: j.low, close: j.close};
   } else {
     // Simple price-only form: track high/low client-side;
